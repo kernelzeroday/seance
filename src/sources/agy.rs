@@ -127,11 +127,19 @@ pub fn scan() -> Result<Vec<Session>> {
     Ok(sessions)
 }
 
-/// The last write to a conversation database, its write-ahead log included.
+/// The last write to a conversation database. Its write-ahead log counts only while it holds
+/// frames: SQLite resets an empty log whenever the database is opened and closed (agy opens
+/// every conversation at once now and then), which says nothing about the conversation.
+/// Once frames are checkpointed into the database, the database's own time has them.
 fn db_mtime(db: &std::path::Path) -> i64 {
     let mut wal = db.as_os_str().to_owned();
     wal.push("-wal");
-    mtime_secs(db).max(mtime_secs(std::path::Path::new(&wal)))
+    let wal = std::path::Path::new(&wal);
+    let wal_time = match std::fs::metadata(wal) {
+        Ok(m) if m.len() > 0 => mtime_secs(wal),
+        _ => 0,
+    };
+    mtime_secs(db).max(wal_time)
 }
 
 // ---------------------------------------------------------------------------------------------

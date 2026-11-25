@@ -38,6 +38,9 @@ install -Dpm 0755 target/rpm/release/seance %{buildroot}%{_bindir}/seance
 %{_bindir}/seance
 
 %changelog
+* Wed Nov 25 2026 kernelzeroday - 0.1.7-1
+- agy: an empty write-ahead log no longer makes old conversations look recent.
+
 * Wed Nov 25 2026 kernelzeroday - 0.1.6-1
 - Come back to the picker when an agent exits (--once / return = false for the old
   hand-off); Ctrl+C reaches only the agent while it runs.
