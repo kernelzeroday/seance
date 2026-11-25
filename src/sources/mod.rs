@@ -61,9 +61,24 @@ pub fn scan(agent: Agent, cache: &FileCache) -> Result<Vec<Session>> {
     }
 }
 
-/// The conversation of `s`, oldest turn first, trimmed to [`MAX_TURNS`].
+/// The conversation of `s` for the preview: oldest turn first, trimmed to [`MAX_TURNS`]
+/// turns of at most [`MAX_TURN_CHARS`] each.
 pub fn transcript(s: &Session) -> Result<Vec<Turn>> {
-    let mut turns = match s.agent {
+    let mut turns = raw_transcript(s)?;
+    for t in &mut turns {
+        if t.text.chars().count() > MAX_TURN_CHARS {
+            t.text = crate::text::clip(&t.text, MAX_TURN_CHARS);
+        }
+    }
+    if turns.len() > MAX_TURNS {
+        turns.drain(..turns.len() - MAX_TURNS);
+    }
+    Ok(turns)
+}
+
+/// The whole conversation of `s`, oldest turn first, untrimmed (for search and `show`).
+pub fn raw_transcript(s: &Session) -> Result<Vec<Turn>> {
+    let turns = match s.agent {
         Agent::Claude => claude::transcript(s),
         Agent::Claurst => claurst::transcript(s),
         Agent::Codex => codex::transcript(s),
@@ -76,7 +91,10 @@ pub fn transcript(s: &Session) -> Result<Vec<Turn>> {
         Agent::Sparkle => sparkle::transcript(s),
         Agent::Sd => sd::transcript(s),
     }?;
-    turns.retain(|t| !t.text.trim().is_empty());
+    let turns: Vec<Turn> = turns
+        .into_iter()
+        .filter(|t| !t.text.trim().is_empty())
+        .collect();
     // Agents often split one reply into several events; show it as one turn.
     let mut merged: Vec<Turn> = Vec::with_capacity(turns.len());
     for t in turns {
@@ -92,16 +110,7 @@ pub fn transcript(s: &Session) -> Result<Vec<Turn>> {
             }),
         }
     }
-    let mut turns = merged;
-    for t in &mut turns {
-        if t.text.chars().count() > MAX_TURN_CHARS {
-            t.text = crate::text::clip(&t.text, MAX_TURN_CHARS);
-        }
-    }
-    if turns.len() > MAX_TURNS {
-        turns.drain(..turns.len() - MAX_TURNS);
-    }
-    Ok(turns)
+    Ok(merged)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -238,7 +247,8 @@ impl FileCache {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        let tmp = path.with_extension("json.tmp");
+        // Per-process temp file: a TUI and a CLI run saving at once must not interleave.
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         if let Ok(bytes) = serde_json::to_vec(&file)
             && fs::write(&tmp, bytes).is_ok()
         {

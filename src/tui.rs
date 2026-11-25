@@ -6,7 +6,8 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
     time::{Duration, Instant},
@@ -31,6 +32,7 @@ use crate::{
     folders::{self, Browser, Row},
     launch::{self, Plan},
     model::{Agent, Role, Session, Turn},
+    search,
     select::{self, PLine, Pos},
     sources::{self, FileCache},
     text::{ago, fit, now, one_line, tilde, wrap},
@@ -42,6 +44,9 @@ const DIM: Color = Color::Rgb(120, 124, 140);
 const FAINT: Color = Color::Rgb(70, 72, 84);
 const SELECT_BG: Color = Color::Rgb(40, 41, 54);
 const TEXT: Color = Color::Rgb(220, 222, 230);
+/// Search matches: snippets in the list, highlights in the preview.
+const MATCH: Color = Color::Rgb(232, 200, 120);
+const MATCH_BG: Color = Color::Rgb(110, 88, 30);
 /// Mouse-selected preview text.
 const SELECT_TEXT_BG: Color = Color::Rgb(90, 70, 110);
 
@@ -144,6 +149,17 @@ struct App {
     here_only: bool,
     /// Indices into `sessions`; row 0 of the list is the pinned "new session" row.
     visible: Vec<usize>,
+    /// Sessions in `visible` that match the filter only in what was said (indices into
+    /// `sessions`): their rows show a snippet instead of their details.
+    text_hits: HashSet<usize>,
+    /// The full-text index, kept current by a background worker.
+    index: Arc<Mutex<search::Index>>,
+    index_tx: Sender<Vec<Session>>,
+    index_rx: Receiver<()>,
+    /// Sessions the worker is extracting text from right now.
+    indexing: Arc<AtomicUsize>,
+    /// The (session, filter) the preview last jumped to a match for.
+    jumped_for: Option<(Key, String)>,
     cursor: usize,
     list_top: usize,
     show_preview: bool,
@@ -188,6 +204,14 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
     let (got_tx, got_rx) = channel();
     std::thread::spawn(move || preview_worker(want_rx, got_tx));
     let (live_tx, live_rx) = channel();
+    let index = Arc::new(Mutex::new(search::Index::load()));
+    let indexing = Arc::new(AtomicUsize::new(0));
+    let (index_tx, index_req) = channel::<Vec<Session>>();
+    let (index_done, index_rx) = channel();
+    {
+        let (index, indexing) = (index.clone(), indexing.clone());
+        std::thread::spawn(move || index_worker(index, index_req, index_done, indexing));
+    }
     let agents: Vec<Agent> = Agent::ALL
         .into_iter()
         .filter(|a| !start.cfg.hidden(*a))
@@ -216,6 +240,12 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
         hits: RefCell::default(),
         sel: None,
         cache: Arc::new(FileCache::load()),
+        text_hits: HashSet::new(),
+        index,
+        index_tx,
+        index_rx,
+        indexing,
+        jumped_for: None,
         live,
         live_rx,
         dirty: HashMap::new(),
@@ -276,8 +306,50 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
     })();
     restore_terminal();
     app.cache.save();
+    if app.settled
+        && let Ok(mut index) = app.index.lock()
+    {
+        index.retain(&app.sessions);
+        index.save();
+    }
     result?;
     Ok(app.plan)
+}
+
+/// Keeps the full-text index current: extracts the text of the sessions it is sent that are
+/// missing or changed (in parallel, outside the lock), then says so.
+fn index_worker(
+    index: Arc<Mutex<search::Index>>,
+    rx: Receiver<Vec<Session>>,
+    done: Sender<()>,
+    pending: Arc<AtomicUsize>,
+) {
+    while let Ok(mut batch) = rx.recv() {
+        while let Ok(more) = rx.try_recv() {
+            batch.extend(more);
+        }
+        let mut seen = HashSet::new();
+        batch.retain(|s| seen.insert(search::doc_key(s)));
+        let stale: Vec<Session> = match index.lock() {
+            Ok(idx) => idx.stale(&batch).into_iter().cloned().collect(),
+            Err(_) => return,
+        };
+        if stale.is_empty() {
+            continue;
+        }
+        pending.store(stale.len(), Ordering::Relaxed);
+        let refs: Vec<&Session> = stale.iter().collect();
+        let texts = search::extract_all(&refs);
+        if let Ok(mut idx) = index.lock() {
+            for (s, text) in texts {
+                idx.insert(s, text);
+            }
+        }
+        pending.store(0, Ordering::Relaxed);
+        if done.send(()).is_err() {
+            return;
+        }
+    }
 }
 
 /// Loads transcripts one at a time, always the most recently asked-for one first.
@@ -382,6 +454,9 @@ impl App {
             }
         }
         if !updated.is_empty() {
+            if self.settled {
+                let _ = self.index_tx.send(updated.clone());
+            }
             for s in updated {
                 let k = key(&s);
                 if Some(&k) == shown.as_ref() {
@@ -421,12 +496,21 @@ impl App {
             if self.selected().map(key) == shown {
                 self.preview_scroll = scroll;
             }
-            if self.scanning == 0 {
+            if self.scanning == 0 && !self.settled {
                 self.settled = true;
+                // Everything is listed: bring the full-text index up to date.
+                let _ = self.index_tx.send(self.sessions.clone());
             }
             // Stale previews of sessions that changed on disk.
             self.previews
                 .retain(|_, p| !matches!(p, Preview::Failed(_)));
+        }
+        if self.index_rx.try_recv().is_ok() {
+            while self.index_rx.try_recv().is_ok() {}
+            act = true;
+            if !self.filter.trim().is_empty() {
+                self.refilter_keep();
+            }
         }
         while let Ok((k, r)) = self.got_rx.try_recv() {
             act = true;
@@ -463,27 +547,51 @@ impl App {
     }
 
     fn refilter(&mut self) {
-        let words: Vec<String> = self
-            .filter
-            .to_lowercase()
-            .split_whitespace()
-            .map(String::from)
-            .collect();
-        self.visible = (0..self.sessions.len())
-            .filter(|&i| {
-                let s = &self.sessions[i];
-                if self.tab.is_some_and(|t| t != s.agent) || (self.here_only && !self.in_here(s)) {
-                    return false;
+        let words = search::words(&self.filter);
+        self.text_hits.clear();
+        let index = self.index.clone();
+        let index = index.lock().ok();
+        let mut visible = Vec::new();
+        for (i, s) in self.sessions.iter().enumerate() {
+            if self.tab.is_some_and(|t| t != s.agent) || (self.here_only && !self.in_here(s)) {
+                continue;
+            }
+            if words.is_empty() {
+                visible.push(i);
+                continue;
+            }
+            // Title and details first, then what was said.
+            match search::hit(s, index.as_ref().and_then(|ix| ix.get(s)), &words) {
+                Some(search::Hit::Meta) => visible.push(i),
+                Some(search::Hit::Text) => {
+                    visible.push(i);
+                    self.text_hits.insert(i);
                 }
-                let hay = s.haystack();
-                words.iter().all(|w| hay.contains(w.as_str()))
-            })
-            .collect();
+                None => {}
+            }
+        }
+        self.visible = visible;
         self.cursor = self.cursor.min(self.visible.len());
         if self.cursor == 0 && !self.visible.is_empty() && !self.filter.is_empty() {
             self.cursor = 1;
         }
         self.preview_scroll = 0;
+    }
+
+    /// Re-runs the filter (the index grew) without moving off the selected session.
+    fn refilter_keep(&mut self) {
+        let k = self.selected().map(key);
+        let scroll = self.preview_scroll;
+        self.refilter();
+        if let Some(k) = &k
+            && let Some(pos) = self
+                .visible
+                .iter()
+                .position(|&i| key(&self.sessions[i]) == *k)
+        {
+            self.cursor = pos + 1;
+            self.preview_scroll = scroll;
+        }
     }
 
     fn selected(&self) -> Option<&Session> {
@@ -1154,6 +1262,13 @@ impl App {
                 Style::default().fg(ACCENT),
             ));
         }
+        let pending = self.indexing.load(Ordering::Relaxed);
+        if pending > 0 {
+            spans.push(Span::styled(
+                format!("  ⌕ indexing {pending}"),
+                Style::default().fg(MATCH),
+            ));
+        }
         if self.live.is_some() {
             spans.push(Span::styled(
                 "  ● live",
@@ -1336,10 +1451,26 @@ impl App {
                 }
                 let rest = format!("  {}", rest.join(" · "));
                 let used = meta[0].content.width();
-                meta.push(Span::styled(
-                    fit(&rest, w.saturating_sub(used + 1)),
-                    Style::default().fg(DIM),
-                ));
+                let si = self.visible[idx - 1];
+                let snip = self
+                    .text_hits
+                    .contains(&si)
+                    .then(|| {
+                        let ix = self.index.lock().ok()?;
+                        search::snippet(ix.get(s)?, &search::words(&self.filter), w)
+                    })
+                    .flatten();
+                match snip {
+                    // Matched in the conversation: show where, instead of the details.
+                    Some(sn) => meta.push(Span::styled(
+                        fit(&format!("  ⌕ {sn}"), w.saturating_sub(used + 1)),
+                        Style::default().fg(MATCH),
+                    )),
+                    None => meta.push(Span::styled(
+                        fit(&rest, w.saturating_sub(used + 1)),
+                        Style::default().fg(DIM),
+                    )),
+                }
                 (s.agent.color(), l1, Line::from(meta))
             };
             let bar = if sel { "▌" } else { " " };
@@ -1517,6 +1648,22 @@ impl App {
         }
         let h = body.height as usize;
         let max_scroll = lines.len().saturating_sub(h);
+        let words = search::words(&self.filter);
+        // Searching: when the session or the query changes, jump to the latest match.
+        if !words.is_empty()
+            && matches!(self.previews.get(&k), Some(Preview::Ready(_)))
+            && self.jumped_for.as_ref() != Some(&(k.clone(), self.filter.clone()))
+        {
+            self.jumped_for = Some((k.clone(), self.filter.clone()));
+            if let Some(i) = lines.iter().rposition(|l| {
+                let lower = l.text.to_ascii_lowercase();
+                words.iter().any(|w| lower.contains(w.as_str()))
+            }) {
+                // Put it a third of the way down the pane.
+                let start = i.saturating_sub(h / 3);
+                self.preview_scroll = lines.len().saturating_sub(h + start);
+            }
+        }
         self.preview_scroll = self.preview_scroll.min(max_scroll);
         let start = lines.len().saturating_sub(h + self.preview_scroll);
         let shown: Vec<Line> = lines
@@ -1526,6 +1673,26 @@ impl App {
             .map(|l| l.line.clone())
             .collect();
         f.render_widget(Paragraph::new(shown), body);
+        if !words.is_empty() {
+            for i in start..(start + h).min(lines.len()) {
+                let l = &lines[i];
+                let lower = l.text.to_ascii_lowercase();
+                let y = body.y + (i - start) as u16;
+                for w in &words {
+                    for (pos, _) in lower.match_indices(w.as_str()) {
+                        let c0 = l.gutter + l.text[..pos].width() as u16;
+                        let c1 = (c0 + l.text[pos..pos + w.len()].width() as u16)
+                            .min(l.width)
+                            .min(body.width);
+                        for c in c0..c1 {
+                            if let Some(cell) = f.buffer_mut().cell_mut((body.x + c, y)) {
+                                cell.set_bg(MATCH_BG).set_fg(Color::White);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let Some(sel) = &self.sel {
             for i in start..(start + h).min(lines.len()) {
                 if let Some((c0, c1)) = select::highlight(&lines, sel.anchor, sel.head, i) {

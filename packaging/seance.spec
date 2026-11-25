@@ -38,6 +38,11 @@ install -Dpm 0755 target/rpm/release/seance %{buildroot}%{_bindir}/seance
 %{_bindir}/seance
 
 %changelog
+* Wed Nov 25 2026 kernelzeroday - 0.2.0-1
+- Full-text search of what was said in every session, in the picker (snippets, highlights,
+  jump to match) and as `seance search`; `show --json --last N`; JSON results carry the
+  resume command; bare seance without a terminal points scripts at the CLI.
+
 * Wed Nov 25 2026 kernelzeroday - 0.1.7-1
 - agy: an empty write-ahead log no longer makes old conversations look recent.
 

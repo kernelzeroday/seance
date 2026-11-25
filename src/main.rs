@@ -6,6 +6,7 @@ mod config;
 mod folders;
 mod launch;
 mod model;
+mod search;
 mod select;
 mod sources;
 mod syslog;
@@ -42,7 +43,12 @@ use crate::{
     after_help = "Agents: claude claurst codex agy omp pi hermes fx goose opencode sparkle sd\n\
                   Config: ~/.config/seance/config.toml    Logs: journalctl -t seance\n\n\
                   Shell integration (stay in the session's folder after the agent exits):\n  \
-                  sea() { local c; c=$(seance --print \"$@\") && eval \"$c\"; }"
+                  sea() { local c; c=$(seance --print \"$@\") && eval \"$c\"; }\n\n\
+                  For scripts and agents (no terminal needed, safe while the TUI runs):\n  \
+                  seance search QUERY --json    sessions whose title or conversation match\n  \
+                  seance show ID --json --last 20\n  \
+                  seance list --json -a claude -H\n\
+                  JSON results carry `resume`: the shell command that reopens the session."
 )]
 struct Cli {
     /// Start with this filter typed in
@@ -90,14 +96,38 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Search session titles and what was said in them (all words must match)
+    #[command(alias = "s")]
+    Search {
+        #[arg(required = true)]
+        query: Vec<String>,
+        /// Only this agent
+        #[arg(short, long, value_name = "AGENT")]
+        agent: Option<String>,
+        /// Only sessions under the current folder
+        #[arg(short = 'H', long)]
+        here: bool,
+        /// At most this many
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        /// One JSON object per line, with a snippet and the resume command
+        #[arg(long)]
+        json: bool,
+    },
     /// Resume a session by id (a unique prefix is enough)
     Resume { id: String },
-    /// Print a session's conversation, as the preview shows it
+    /// Print a session's whole conversation
     Show {
         id: String,
         /// Copy it to the clipboard (wl-copy, xclip/xsel, or OSC 52) instead of printing
         #[arg(short = 'y', long)]
         copy: bool,
+        /// One JSON object: the session, its resume command and its turns
+        #[arg(long)]
+        json: bool,
+        /// Only the last N turns
+        #[arg(short = 'l', long, value_name = "N")]
+        last: Option<usize>,
     },
     /// Start a new session with AGENT in DIR (default: here)
     New { agent: String, dir: Option<PathBuf> },
@@ -140,6 +170,14 @@ fn scan_all(cfg: &Config) -> Vec<Session> {
     all
 }
 
+/// A session as JSON for scripts and agents, with the command that reopens it.
+fn session_json(cfg: &Config, s: &Session, here: &std::path::Path) -> serde_json::Value {
+    let mut v = serde_json::to_value(s).unwrap_or_default();
+    let plan = launch::resume(cfg, s, here);
+    v["resume"] = serde_json::json!(plan.shell());
+    v
+}
+
 /// The one session whose id starts with `id`.
 fn find<'a>(all: &'a [Session], id: &str) -> Result<&'a Session> {
     let hits: Vec<&Session> = all.iter().filter(|s| s.id.starts_with(id)).collect();
@@ -170,6 +208,12 @@ fn exit_notice(agent: &str, st: std::process::ExitStatus) -> (String, bool) {
     }
 }
 
+/// Whether the picker can run: it draws on stderr and reads keys from the terminal.
+fn interactive() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal() && std::fs::File::open("/dev/tty").is_ok()
+}
+
 fn run_plan(plan: Plan, print: bool) -> Result<()> {
     if print {
         println!("{}", plan.shell());
@@ -193,6 +237,13 @@ fn real_main() -> Result<()> {
     let here =
         std::env::current_dir().unwrap_or_else(|_| text::home().unwrap_or_else(|| "/".into()));
     match cli.cmd {
+        None if !interactive() => {
+            bail!(
+                "no terminal to draw the picker on. From scripts and agents use \
+                 `seance search QUERY`, `seance list` or `seance show ID` (all take --json); \
+                 see `seance --help`"
+            )
+        }
         None => {
             let agent = cli.agent.as_deref().map(parse_agent).transpose()?;
             let mouse = !cli.no_mouse && cfg.mouse.unwrap_or(true);
@@ -242,7 +293,7 @@ fn real_main() -> Result<()> {
                 .take(limit)
             {
                 if json {
-                    out!("{}", serde_json::to_string(&s)?);
+                    out!("{}", session_json(&cfg, &s, &here));
                 } else {
                     out!(
                         "{:<9} {:>4}  {:<38}  {}  {}",
@@ -264,15 +315,106 @@ fn real_main() -> Result<()> {
             let s = find(&all, &id)?;
             run_plan(launch::resume(&cfg, s, &here), cli.print)
         }
-        Some(Cmd::Show { id, copy }) => {
+        Some(Cmd::Show {
+            id,
+            copy,
+            json,
+            last,
+        }) => {
             let all = scan_all(&cfg);
             let s = find(&all, &id)?;
-            let text = model::plain(s, &sources::transcript(s)?);
+            let mut turns = sources::raw_transcript(s)?;
+            if let Some(n) = last {
+                turns.drain(..turns.len().saturating_sub(n));
+            }
+            if json {
+                let mut v = session_json(&cfg, s, &here);
+                v["turns"] = turns
+                    .iter()
+                    .map(|t| {
+                        let role = match t.role {
+                            model::Role::User => "user",
+                            model::Role::Assistant => "assistant",
+                            model::Role::Tool => "tool",
+                            model::Role::Info => "info",
+                        };
+                        serde_json::json!({ "role": role, "text": t.text })
+                    })
+                    .collect();
+                out!("{v}");
+                return Ok(());
+            }
+            let text = model::plain(s, &turns);
             if copy {
                 let via = clipboard::copy(&text)?;
                 eprintln!("copied {} lines via {via}", text.lines().count());
             } else {
                 out!("{}", text.trim_end());
+            }
+            Ok(())
+        }
+        Some(Cmd::Search {
+            query,
+            agent,
+            here: here_only,
+            limit,
+            json,
+        }) => {
+            let agent = agent.as_deref().map(parse_agent).transpose()?;
+            let all = scan_all(&cfg);
+            let mut index = search::Index::load();
+            if index.refresh(&all) > 0 {
+                index.save();
+            }
+            let words = search::words(&query.join(" "));
+            let now = text::now();
+            let mut shown = 0;
+            for s in all
+                .iter()
+                .filter(|s| agent.is_none_or(|a| a == s.agent))
+                .filter(|s| !here_only || s.cwd.as_ref().is_some_and(|c| c.starts_with(&here)))
+            {
+                let doc = index.get(s);
+                let Some(hit) = search::hit(s, doc, &words) else {
+                    continue;
+                };
+                let snippet = doc
+                    .filter(|_| hit == search::Hit::Text)
+                    .and_then(|d| search::snippet(d, &words, 110));
+                if json {
+                    let mut v = session_json(&cfg, s, &here);
+                    v["matched"] = serde_json::json!(if hit == search::Hit::Meta {
+                        "details"
+                    } else {
+                        "text"
+                    });
+                    if let Some(sn) = &snippet {
+                        v["snippet"] = serde_json::json!(sn);
+                    }
+                    out!("{v}");
+                } else {
+                    out!(
+                        "{:<9} {:>4}  {:<38}  {}  {}",
+                        s.agent.key(),
+                        text::ago(s.updated, now),
+                        text::fit(&s.id, 38),
+                        s.cwd
+                            .as_ref()
+                            .map(|c| text::tilde(c))
+                            .unwrap_or_else(|| "-".into()),
+                        text::fit(&s.title, 70),
+                    );
+                    if let Some(sn) = &snippet {
+                        out!("          {sn}");
+                    }
+                }
+                shown += 1;
+                if shown >= limit {
+                    break;
+                }
+            }
+            if shown == 0 {
+                std::process::exit(1);
             }
             Ok(())
         }

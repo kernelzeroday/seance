@@ -35,6 +35,16 @@ new session with any agent, here or in a folder you browse to.
 | `sparkle`  | `~/.local/share/sparkle/sparkle.db`                  | `sparkle chat --cid <id>`                 |
 | `sd`       | `~/.local/share/sd-tui/sessions/<id>.jsonl`          | `sd --resume <id>`                        |
 
+### Search
+
+The filter searches titles, first prompts, folders, models and ids, **and what was said**:
+every word must appear somewhere in the session's details or its conversation. A session
+that matched only in its conversation shows the matching words on its second line
+(`⌕ …snippet…`), and the preview highlights every match and opens at the latest one. Only
+your messages and the agent's replies are indexed, not tool output or system prompts. The
+text index lives in `~/.cache/seance/text-index.json` and is kept current in the background
+(`⌕ indexing N` in the header); only sessions that changed are read again.
+
 ### Live
 
 The list and the open preview update live: seance asks the kernel (inotify) to tell it when
@@ -94,7 +104,8 @@ as `~/src/x` then Enter jumps there.
 ```
 seance [FILTER…]          open the picker (-a AGENT one tab, -H only this folder, -n new-session menu, --no-mouse, --once)
 seance list [-a AGENT] [-H] [-n N] [--json]
-seance show ID [--copy]   print a session's conversation, or copy it
+seance search QUERY…      search titles and conversations (--json, -a, -H, -n)
+seance show ID [--copy]   print a session's whole conversation, or copy it (--json, --last N)
 seance resume ID          resume by id (a unique prefix is enough)
 seance new AGENT [DIR]    start a new session
 seance agents             which agents are installed, with session counts
@@ -112,6 +123,26 @@ picker when it exits**, with the session you just used on top (a failed exit is 
 footer). While the agent runs, Ctrl+C goes to the agent only; Ctrl+Z suspends both and your
 shell's `fg` resumes them. `--once` (or `return = false` in the config) hands the terminal
 over for good instead (`exec`).
+
+## For scripts and agents
+
+Everything the picker shows is available without a terminal, and the CLI is safe to run
+while the TUI is open (both only read the agents' stores; their caches are written
+atomically per process):
+
+```
+seance search QUERY… [-a AGENT] [-H] [-n N] [--json]   sessions whose details or conversation match
+seance show ID [--json] [--last N]                      a whole conversation (untrimmed)
+seance list [-a AGENT] [-H] [-n N] [--json]             newest first
+seance agents                                           installed agents and session counts
+```
+
+`--json` prints one object per session (`agent`, `id`, `title`, `prompt`, `cwd`, `updated` as
+Unix seconds, `messages`, `model`, `path`) plus `resume`, the shell command that reopens it;
+`search` adds `matched` (`details` or `text`) and `snippet`, and `show --json` adds `turns`
+(`role`: user / assistant / tool / info, `text`). Ids can be shortened to any unique prefix.
+`search` exits 1 when nothing matches. Run without a terminal, bare `seance` says how to
+use these instead of trying to draw the picker.
 
 ## Config
 
