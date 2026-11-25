@@ -15,7 +15,7 @@ use crate::{
     text::is_scaffolding,
 };
 
-fn root() -> PathBuf {
+pub(super) fn root() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| super::home().join(".codex"))

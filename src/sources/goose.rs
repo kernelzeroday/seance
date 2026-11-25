@@ -9,7 +9,7 @@ use serde_json::Value;
 use super::{content_text, open_db, titleize, tool_line};
 use crate::model::{Agent, Role, Session, Turn};
 
-fn db() -> PathBuf {
+pub(super) fn db() -> PathBuf {
     directories::BaseDirs::new()
         .map(|d| d.data_dir().to_path_buf())
         .unwrap_or_else(|| super::home().join(".local/share"))

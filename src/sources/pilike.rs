@@ -13,7 +13,7 @@ use crate::{
     text::{is_scaffolding, strip_tags},
 };
 
-fn root(agent: Agent) -> PathBuf {
+pub(super) fn root(agent: Agent) -> PathBuf {
     match agent {
         Agent::Pi => std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
             .map(PathBuf::from)

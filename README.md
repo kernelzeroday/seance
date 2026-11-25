@@ -34,6 +34,17 @@ new session with any agent, here or in a folder you browse to.
 | `sparkle`  | `~/.local/share/sparkle/sparkle.db`                  | `sparkle chat --cid <id>`                 |
 | `sd`       | `~/.local/share/sd-tui/sessions/<id>.jsonl`          | `sd --resume <id>`                        |
 
+### Live
+
+The list and the open preview update live: seance asks the kernel (inotify) to tell it when
+a file in one of the agents' session folders is written, so it never polls. A new session
+shows up within a second of its agent writing it; the session you are previewing streams in
+as the agent replies (it follows the bottom, or stays put if you scrolled up). Each burst of
+writes is debounced and only the agent that changed is rescanned, re-reading only the files
+whose size or time changed. Seance's own reads never wake it (SQLite `-shm` files and
+open/close events are ignored); idle, it uses no measurable CPU. `● live` in the header
+shows the watches are on; ^R still rescans everything.
+
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_SESSION_DIR` and
 `XDG_DATA_HOME` are honoured. seance only ever reads these files and databases (SQLite is
 opened read-only). Parsed file sessions are cached in `~/.cache/seance/index.json` by size

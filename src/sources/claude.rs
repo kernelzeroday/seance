@@ -12,7 +12,7 @@ use crate::{
     text::is_scaffolding,
 };
 
-fn root() -> PathBuf {
+pub(super) fn root() -> PathBuf {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| super::home().join(".claude"))

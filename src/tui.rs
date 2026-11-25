@@ -34,6 +34,7 @@ use crate::{
     select::{self, PLine, Pos},
     sources::{self, FileCache},
     text::{ago, fit, now, one_line, tilde, wrap},
+    watch,
 };
 
 const ACCENT: Color = Color::Rgb(255, 160, 200);
@@ -45,6 +46,9 @@ const TEXT: Color = Color::Rgb(220, 222, 230);
 const SELECT_TEXT_BG: Color = Color::Rgb(90, 70, 110);
 
 type Key = (Agent, String);
+
+/// A rendered preview: session, width, lines, and the transcript they came from.
+type Rendered = (Key, u16, Arc<Vec<PLine>>, Arc<Vec<Turn>>);
 
 /// Ctrl+C / Ctrl+D must be pressed twice within this long to quit.
 const QUIT_WINDOW: Duration = Duration::from_millis(1500);
@@ -144,9 +148,18 @@ struct App {
     previews: HashMap<Key, Preview>,
     /// Lines scrolled up from the bottom of the preview.
     preview_scroll: usize,
-    preview_lines: Option<(Key, u16, Arc<Vec<PLine>>)>,
+    preview_lines: Option<Rendered>,
     hits: RefCell<Hits>,
     sel: Option<Sel>,
+    /// One cache for the whole run, so live rescans only re-read files that changed.
+    cache: Arc<FileCache>,
+    /// The inotify watches; None when live updates are unavailable.
+    live: Option<watch::Live>,
+    live_rx: Receiver<Agent>,
+    /// Agents with changes not yet rescanned: (first change, last change).
+    dirty: HashMap<Agent, (Instant, Instant)>,
+    /// Agents being scanned right now.
+    in_flight: HashSet<Agent>,
     last_click: Option<(Instant, u16, u16)>,
     overlay: Option<Overlay>,
     status: Option<(String, Tone, Instant, Duration)>,
@@ -168,6 +181,12 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
     let (want_tx, want_rx) = channel::<Session>();
     let (got_tx, got_rx) = channel();
     std::thread::spawn(move || preview_worker(want_rx, got_tx));
+    let (live_tx, live_rx) = channel();
+    let agents: Vec<Agent> = Agent::ALL
+        .into_iter()
+        .filter(|a| !start.cfg.hidden(*a))
+        .collect();
+    let live = watch::start(&agents, live_tx);
 
     let installed = Agent::ALL
         .into_iter()
@@ -190,6 +209,11 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
         preview_lines: None,
         hits: RefCell::default(),
         sel: None,
+        cache: Arc::new(FileCache::load()),
+        live,
+        live_rx,
+        dirty: HashMap::new(),
+        in_flight: HashSet::new(),
         last_click: None,
         overlay: None,
         status: None,
@@ -211,10 +235,21 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
     // Draw on stderr so stdout stays free for `--print` (`eval "$(seance --print)"`).
     let mut terminal = init_terminal(start.mouse)?;
     let result = (|| -> Result<()> {
+        // Redraw only when something changed: idle, seance just waits for input and
+        // checks its channels a few times a second.
+        let mut redraw = true;
         while !app.quit {
-            app.pump();
-            terminal.draw(|f| app.draw(f))?;
-            if event::poll(Duration::from_millis(60))? {
+            redraw |= app.pump();
+            // The scanning spinner animates.
+            redraw |= app.scanning > 0;
+            if redraw {
+                terminal.draw(|f| app.draw(f))?;
+                redraw = false;
+            }
+            let busy = app.scanning > 0 || !app.dirty.is_empty();
+            let wait = Duration::from_millis(if busy { 60 } else { 250 });
+            if event::poll(wait)? {
+                redraw = true;
                 match event::read()? {
                     Event::Key(k) if k.kind != KeyEventKind::Release => app.key(k),
                     Event::Mouse(m) => app.mouse(m),
@@ -230,6 +265,7 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
         Ok(())
     })();
     restore_terminal();
+    app.cache.save();
     result?;
     Ok(app.plan)
 }
@@ -248,41 +284,83 @@ fn preview_worker(rx: Receiver<Session>, tx: Sender<(Key, Result<Vec<Turn>, Stri
 }
 
 impl App {
+    /// Scans every agent (on start and ^R).
     fn rescan(&mut self) {
-        let cache = Arc::new(FileCache::load());
         let agents: Vec<Agent> = Agent::ALL
             .into_iter()
             .filter(|a| !self.cfg.hidden(*a))
             .collect();
-        self.scanning = agents.len();
-        let (done_tx, done_rx) = channel::<()>();
-        for a in agents.iter().copied() {
-            let (tx, cache, done) = (self.scan_tx.clone(), cache.clone(), done_tx.clone());
-            std::thread::spawn(move || {
-                let r = sources::scan(a, &cache).map_err(|e| format!("{e:#}"));
-                let _ = tx.send((a, r));
-                let _ = done.send(());
-            });
+        for a in agents {
+            self.scan(a);
         }
-        drop(done_tx);
-        let n = agents.len();
+    }
+
+    /// Scans one agent in the background, unless it is being scanned already (then it is
+    /// marked dirty and scanned again once that finishes).
+    fn scan(&mut self, a: Agent) {
+        if !self.in_flight.insert(a) {
+            let now = Instant::now();
+            self.dirty.entry(a).or_insert((now, now));
+            return;
+        }
+        self.scanning += 1;
+        let (tx, cache) = (self.scan_tx.clone(), self.cache.clone());
         std::thread::spawn(move || {
-            for _ in 0..n {
-                if done_rx.recv().is_err() {
-                    return;
-                }
-            }
-            cache.save();
+            let r = sources::scan(a, &cache).map_err(|e| format!("{e:#}"));
+            let _ = tx.send((a, r));
         });
     }
 
+    /// Live updates: collects change events and rescans each agent once its burst of
+    /// writes settles (or at least every 1.5 s while it keeps writing).
+    fn pump_live(&mut self) -> bool {
+        let now = Instant::now();
+        while let Ok(a) = self.live_rx.try_recv() {
+            let e = self.dirty.entry(a).or_insert((now, now));
+            e.1 = now;
+        }
+        let due: Vec<Agent> = self
+            .dirty
+            .iter()
+            .filter(|(a, (first, last))| {
+                !self.in_flight.contains(a)
+                    && (last.elapsed() >= Duration::from_millis(300)
+                        || first.elapsed() >= Duration::from_millis(1500))
+            })
+            .map(|(a, _)| *a)
+            .collect();
+        let any = !due.is_empty();
+        for a in due {
+            self.dirty.remove(&a);
+            self.scan(a);
+        }
+        any
+    }
+
     /// Takes in finished scans and transcripts.
-    fn pump(&mut self) {
+    /// Returns whether anything changed that the screen should show.
+    fn pump(&mut self) -> bool {
+        let mut act = self.pump_live();
         let mut changed = false;
+        let mut updated: Vec<Session> = Vec::new();
         while let Ok((agent, r)) = self.scan_rx.try_recv() {
+            act = true;
             self.scanning = self.scanning.saturating_sub(1);
+            self.in_flight.remove(&agent);
             match r {
                 Ok(list) => {
+                    // Sessions that are new or changed since the last scan of this agent.
+                    let before: HashMap<Key, (i64, usize)> = self
+                        .sessions
+                        .iter()
+                        .filter(|s| s.agent == agent)
+                        .map(|s| (key(s), (s.updated, s.messages)))
+                        .collect();
+                    updated.extend(
+                        list.iter()
+                            .filter(|s| before.get(&key(s)) != Some(&(s.updated, s.messages)))
+                            .cloned(),
+                    );
                     self.sessions.retain(|s| s.agent != agent);
                     self.sessions.extend(list);
                     changed = true;
@@ -290,8 +368,27 @@ impl App {
                 Err(e) => crate::syslog::warning(&format!("{}: {e}", agent.key())),
             }
         }
+        if !updated.is_empty() {
+            let shown = self.selected().map(key);
+            for s in updated {
+                let k = key(&s);
+                if Some(&k) == shown.as_ref() {
+                    // The open preview: fetch it again and swap it in when it arrives, so
+                    // a running conversation streams in without a "loading…" flash.
+                    if matches!(self.previews.get(&k), Some(Preview::Ready(_))) {
+                        let _ = self.want_tx.send(s);
+                    } else {
+                        self.previews.remove(&k);
+                    }
+                } else {
+                    self.previews.remove(&k);
+                }
+            }
+        }
         if changed {
             let keep = self.selected().filter(|_| self.touched).map(key);
+            let was = self.selected().map(key);
+            let scroll = self.preview_scroll;
             self.sessions.sort_by_key(|s| std::cmp::Reverse(s.updated));
             self.refilter();
             match keep {
@@ -309,11 +406,16 @@ impl App {
                     self.list_top = 0;
                 }
             }
+            // Same session still shown: a live update must not yank the preview's scroll.
+            if self.selected().map(key) == was {
+                self.preview_scroll = scroll;
+            }
             // Stale previews of sessions that changed on disk.
             self.previews
                 .retain(|_, p| !matches!(p, Preview::Failed(_)));
         }
         while let Ok((k, r)) = self.got_rx.try_recv() {
+            act = true;
             self.previews.insert(
                 k,
                 match r {
@@ -326,6 +428,7 @@ impl App {
             && let Some(s) = self.selected()
             && !self.previews.contains_key(&key(s))
         {
+            act = true;
             let s = s.clone();
             self.previews.insert(key(&s), Preview::Loading);
             let _ = self.want_tx.send(s);
@@ -334,7 +437,9 @@ impl App {
             && t.elapsed() > *ttl
         {
             self.status = None;
+            act = true;
         }
+        act
     }
 
     fn in_here(&self, s: &Session) -> bool {
@@ -639,7 +744,7 @@ impl App {
     }
 
     fn select_turn(&mut self, k: Key, line: usize) {
-        let Some((_, _, lines)) = &self.preview_lines else {
+        let Some((_, _, lines, _)) = &self.preview_lines else {
             return;
         };
         if let Some((a, b)) = select::turn_span(lines, line) {
@@ -654,7 +759,7 @@ impl App {
     }
 
     fn copy_selection(&mut self) {
-        let (Some(sel), Some((pk, _, lines))) = (&self.sel, &self.preview_lines) else {
+        let (Some(sel), Some((pk, _, lines, _))) = (&self.sel, &self.preview_lines) else {
             return;
         };
         if *pk != sel.key {
@@ -1035,6 +1140,12 @@ impl App {
                 Style::default().fg(ACCENT),
             ));
         }
+        if self.live.is_some() {
+            spans.push(Span::styled(
+                "  ● live",
+                Style::default().fg(Color::Rgb(120, 220, 150)),
+            ));
+        }
         let right = if self.here_only {
             format!("only under {} ", tilde(&self.launch_dir))
         } else {
@@ -1362,12 +1473,25 @@ impl App {
         };
         let lines = match self.previews.get(&k) {
             Some(Preview::Ready(turns)) => match &self.preview_lines {
-                Some((pk, pw, l)) if *pk == k && *pw == body.width => l.clone(),
-                _ => {
+                Some((pk, pw, l, src))
+                    if *pk == k && *pw == body.width && Arc::ptr_eq(src, turns) =>
+                {
+                    l.clone()
+                }
+                old => {
                     let l = Arc::new(render_turns(turns, &s, body.width as usize));
-                    self.preview_lines = Some((k.clone(), body.width, l.clone()));
-                    // A new layout invalidates any selection made on the old one.
-                    self.sel = None;
+                    match old {
+                        // The same session grew (a live update): if the user had scrolled
+                        // up, keep the same lines in view; the bottom keeps following.
+                        Some((pk, pw, ol, _)) if *pk == k && *pw == body.width => {
+                            if self.preview_scroll > 0 {
+                                self.preview_scroll += l.len().saturating_sub(ol.len());
+                            }
+                        }
+                        // A new layout invalidates any selection made on the old one.
+                        _ => self.sel = None,
+                    }
+                    self.preview_lines = Some((k.clone(), body.width, l.clone(), turns.clone()));
                     l
                 }
             },

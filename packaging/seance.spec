@@ -38,6 +38,10 @@ install -Dpm 0755 target/rpm/release/seance %{buildroot}%{_bindir}/seance
 %{_bindir}/seance
 
 %changelog
+* Tue Nov 24 2026 kernelzeroday - 0.1.3-1
+- Live updates with inotify: new and changed sessions appear without polling, and the
+  open preview streams new messages; redraws only when something changes.
+
 * Tue Nov 24 2026 kernelzeroday - 0.1.2-1
 - Ctrl+C / Ctrl+D must be pressed twice in quick succession to quit; the first
   Ctrl+C clears the filter.

@@ -19,7 +19,7 @@ use serde_json::Value;
 use super::{each_json_line, mtime_secs, open_db, titleize, tool_line};
 use crate::model::{Agent, Role, Session, Turn};
 
-fn root() -> PathBuf {
+pub(super) fn root() -> PathBuf {
     super::home().join(".gemini").join("antigravity-cli")
 }
 

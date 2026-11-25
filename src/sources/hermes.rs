@@ -8,7 +8,7 @@ use anyhow::Result;
 use super::{open_db, titleize, tool_line};
 use crate::model::{Agent, Role, Session, Turn};
 
-fn db() -> PathBuf {
+pub(super) fn db() -> PathBuf {
     std::env::var_os("HERMES_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| super::home().join(".hermes"))

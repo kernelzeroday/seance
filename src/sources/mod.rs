@@ -102,6 +102,71 @@ pub fn transcript(s: &Session) -> Result<Vec<Turn>> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// What to watch for live updates
+
+/// A directory whose changes can mean new or updated sessions of one agent.
+pub struct Watch {
+    pub dir: PathBuf,
+    pub recursive: bool,
+    /// Whether a changed path in `dir` is one the agent's sessions live in.
+    pub accept: fn(&Path) -> bool,
+}
+
+fn name(p: &Path) -> &str {
+    p.file_name().and_then(|n| n.to_str()).unwrap_or("")
+}
+
+fn jsonl(p: &Path) -> bool {
+    name(p).ends_with(".jsonl")
+}
+
+/// An SQLite database or its write-ahead log. Never `-shm`: readers (seance included) write
+/// to it, so watching it would wake seance on its own reads.
+fn sqlite(p: &Path, db: &str) -> bool {
+    let n = name(p);
+    n == db || n == format!("{db}-wal")
+}
+
+pub fn watches(agent: Agent) -> Vec<Watch> {
+    let w = |dir: PathBuf, recursive: bool, accept: fn(&Path) -> bool| Watch {
+        dir,
+        recursive,
+        accept,
+    };
+    match agent {
+        Agent::Claude => vec![w(claude::root(), true, jsonl)],
+        Agent::Codex => vec![
+            w(codex::root().join("sessions"), true, jsonl),
+            w(codex::root(), false, |p| name(p) == "session_index.jsonl"),
+        ],
+        Agent::Agy => vec![
+            w(agy::root().join("conversations"), false, |p| {
+                name(p).ends_with(".db") || name(p).ends_with(".db-wal")
+            }),
+            w(agy::root().join("cache"), false, |p| {
+                name(p) == "conversation_metadata.json"
+            }),
+            w(agy::root(), false, |p| name(p) == "history.jsonl"),
+        ],
+        Agent::Omp | Agent::Pi => vec![w(pilike::root(agent), true, jsonl)],
+        Agent::Hermes => vec![w(parent(hermes::db()), false, |p| sqlite(p, "state.db"))],
+        Agent::Fx => vec![w(fx::root(), true, |p| {
+            matches!(name(p), "index.jsonl" | "log.jsonl")
+        })],
+        Agent::Goose => vec![w(parent(goose::db()), false, |p| sqlite(p, "sessions.db"))],
+        Agent::Opencode => vec![w(parent(opencode::db()), false, |p| {
+            sqlite(p, "opencode.db")
+        })],
+        Agent::Sparkle => vec![w(parent(sparkle::db()), false, |p| sqlite(p, "sparkle.db"))],
+        Agent::Sd => vec![w(sd::root(), false, jsonl)],
+    }
+}
+
+fn parent(p: PathBuf) -> PathBuf {
+    p.parent().map(Path::to_path_buf).unwrap_or(p)
+}
+
+// ---------------------------------------------------------------------------------------------
 // File cache
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -144,10 +209,15 @@ impl FileCache {
         }
     }
 
-    /// Writes the entries used by this scan (stale paths fall away).
+    /// Writes what is known: entries seen since loading override the loaded ones, and files
+    /// that no longer exist fall away.
     pub fn save(&self) {
         let Some(path) = Self::path() else { return };
-        let entries = self.new.lock().map(|m| m.clone()).unwrap_or_default();
+        let mut entries = self.old.clone();
+        if let Ok(m) = self.new.lock() {
+            entries.extend(m.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        entries.retain(|p, _| p.exists());
         let file = CacheFile {
             version: CACHE_VERSION,
             entries,
@@ -173,8 +243,15 @@ impl FileCache {
             .map(|d| d.as_nanos() as i128)
             .unwrap_or(0);
         let size = meta.len();
-        let entry = match self.old.get(path) {
-            Some(e) if e.mtime == mtime && e.size == size => e.clone(),
+        // A long-lived cache rescans many times: what it saw last beats what it loaded.
+        let known = self
+            .new
+            .lock()
+            .ok()
+            .and_then(|m| m.get(path).cloned())
+            .or_else(|| self.old.get(path).cloned());
+        let entry = match known {
+            Some(e) if e.mtime == mtime && e.size == size => e,
             _ => Entry {
                 mtime,
                 size,

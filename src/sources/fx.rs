@@ -10,7 +10,7 @@ use serde_json::Value;
 use super::{each_json_line, titleize, tool_line};
 use crate::model::{Agent, Role, Session, Turn};
 
-fn root() -> PathBuf {
+pub(super) fn root() -> PathBuf {
     super::home().join(".fx").join("sessions").join("v2")
 }
 

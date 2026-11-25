@@ -11,6 +11,7 @@ mod sources;
 mod syslog;
 mod text;
 mod tui;
+mod watch;
 
 use std::{io::Write, path::PathBuf};
 
