@@ -6,6 +6,7 @@
 
 mod agy;
 mod claude;
+mod claurst;
 mod codex;
 mod fx;
 mod goose;
@@ -46,6 +47,7 @@ pub fn home() -> PathBuf {
 pub fn scan(agent: Agent, cache: &FileCache) -> Result<Vec<Session>> {
     match agent {
         Agent::Claude => claude::scan(cache),
+        Agent::Claurst => claurst::scan(cache),
         Agent::Codex => codex::scan(cache),
         Agent::Agy => agy::scan(),
         Agent::Omp => pilike::scan(Agent::Omp, cache),
@@ -63,6 +65,7 @@ pub fn scan(agent: Agent, cache: &FileCache) -> Result<Vec<Session>> {
 pub fn transcript(s: &Session) -> Result<Vec<Turn>> {
     let mut turns = match s.agent {
         Agent::Claude => claude::transcript(s),
+        Agent::Claurst => claurst::transcript(s),
         Agent::Codex => codex::transcript(s),
         Agent::Agy => agy::transcript(s),
         Agent::Omp | Agent::Pi => pilike::transcript(s),
@@ -135,6 +138,13 @@ pub fn watches(agent: Agent) -> Vec<Watch> {
     };
     match agent {
         Agent::Claude => vec![w(claude::root(), true, jsonl)],
+        // The snapshot is replaced by rename and the journal appended; never the .lock.
+        Agent::Claurst => vec![w(claurst::sessions_dir(), false, |p| {
+            matches!(
+                p.extension().and_then(|x| x.to_str()),
+                Some("json" | "jsonl")
+            )
+        })],
         Agent::Codex => vec![
             w(codex::root().join("sessions"), true, jsonl),
             w(codex::root(), false, |p| name(p) == "session_index.jsonl"),
@@ -183,7 +193,7 @@ pub struct FileCache {
     new: Mutex<HashMap<PathBuf, Entry>>,
 }
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
@@ -217,7 +227,10 @@ impl FileCache {
         if let Ok(m) = self.new.lock() {
             entries.extend(m.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
-        entries.retain(|p, _| p.exists());
+        // Claurst entries are keyed by `<sessions>/<id>`, which is not itself a file.
+        entries.retain(|p, _| {
+            p.exists() || p.with_extension("json").exists() || p.with_extension("jsonl").exists()
+        });
         let file = CacheFile {
             version: CACHE_VERSION,
             entries,
@@ -233,16 +246,33 @@ impl FileCache {
         }
     }
 
-    /// The session parsed from `path`, from the cache when the file is unchanged.
-    fn get(&self, path: &Path, parse: impl Fn(&Path) -> Option<Session>) -> Option<Session> {
-        let meta = fs::metadata(path).ok()?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as i128)
-            .unwrap_or(0);
-        let size = meta.len();
+    /// The session parsed from `path`, from the cache when its files are unchanged. `deps`
+    /// lists the files the session is read from (just `path` for most agents); the cache
+    /// entry is valid while their newest mtime and total size stay the same.
+    fn get(
+        &self,
+        path: &Path,
+        deps: impl Fn(&Path) -> Vec<PathBuf>,
+        parse: impl Fn(&Path) -> Option<Session>,
+    ) -> Option<Session> {
+        let (mut mtime, mut size, mut any) = (0i128, 0u64, false);
+        for dep in deps(path) {
+            let Ok(meta) = fs::metadata(&dep) else {
+                continue;
+            };
+            any = true;
+            let m = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i128)
+                .unwrap_or(0);
+            mtime = mtime.max(m);
+            size += meta.len();
+        }
+        if !any {
+            return None;
+        }
         // A long-lived cache rescans many times: what it saw last beats what it loaded.
         let known = self
             .new
@@ -271,6 +301,17 @@ impl FileCache {
         files: Vec<PathBuf>,
         parse: impl Fn(&Path) -> Option<Session> + Sync,
     ) -> Vec<Session> {
+        self.parse_all_with(files, |p| vec![p.to_path_buf()], parse)
+    }
+
+    /// Like [`parse_all`](Self::parse_all), for sessions read from several files: `deps`
+    /// names them for each key path.
+    pub fn parse_all_with(
+        &self,
+        files: Vec<PathBuf>,
+        deps: impl Fn(&Path) -> Vec<PathBuf> + Sync,
+        parse: impl Fn(&Path) -> Option<Session> + Sync,
+    ) -> Vec<Session> {
         let next = AtomicUsize::new(0);
         let out = Mutex::new(Vec::with_capacity(files.len()));
         let threads = std::thread::available_parallelism()
@@ -283,7 +324,7 @@ impl FileCache {
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(f) = files.get(i) else { break };
-                        if let Some(s) = self.get(f, &parse)
+                        if let Some(s) = self.get(f, &deps, &parse)
                             && let Ok(mut o) = out.lock()
                         {
                             o.push(s);

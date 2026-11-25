@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum Agent {
     Claude,
+    Claurst,
     Codex,
     Agy,
     Omp,
@@ -22,8 +23,9 @@ pub enum Agent {
 }
 
 impl Agent {
-    pub const ALL: [Agent; 11] = [
+    pub const ALL: [Agent; 12] = [
         Agent::Claude,
+        Agent::Claurst,
         Agent::Codex,
         Agent::Agy,
         Agent::Omp,
@@ -40,6 +42,7 @@ impl Agent {
     pub fn key(self) -> &'static str {
         match self {
             Agent::Claude => "claude",
+            Agent::Claurst => "claurst",
             Agent::Codex => "codex",
             Agent::Agy => "agy",
             Agent::Omp => "omp",
@@ -69,6 +72,7 @@ impl Agent {
     pub fn describe(self) -> &'static str {
         match self {
             Agent::Claude => "Claude Code",
+            Agent::Claurst => "Claurst (Rust)",
             Agent::Codex => "OpenAI Codex CLI",
             Agent::Agy => "Antigravity CLI",
             Agent::Omp => "oh-my-pi",
@@ -85,6 +89,7 @@ impl Agent {
     pub fn color(self) -> Color {
         let (r, g, b) = match self {
             Agent::Claude => (217, 119, 87),
+            Agent::Claurst => (222, 165, 132),
             Agent::Codex => (127, 209, 174),
             Agent::Agy => (110, 168, 254),
             Agent::Omp => (247, 198, 107),
@@ -123,7 +128,7 @@ impl Agent {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| id.clone());
         let v: Vec<String> = match self {
-            Agent::Claude => vec!["--resume".into(), id],
+            Agent::Claude | Agent::Claurst => vec!["--resume".into(), id],
             Agent::Codex => vec!["resume".into(), id],
             Agent::Agy => vec!["--conversation".into(), id],
             Agent::Omp => vec!["--resume".into(), path],

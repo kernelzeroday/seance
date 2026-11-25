@@ -23,6 +23,7 @@ new session with any agent, here or in a folder you browse to.
 | agent      | sessions read from                                   | resumed with                              |
 |------------|------------------------------------------------------|-------------------------------------------|
 | `claude`   | `~/.claude/projects/*/<id>.jsonl`                    | `claude --resume <id>` (in its folder)    |
+| `claurst`  | `~/.claurst/sessions/<id>.json` + `.jsonl` journal   | `claurst --resume <id>` (in its folder)   |
 | `codex`    | `~/.codex/sessions/**/rollout-*.jsonl`               | `codex resume <id>`                       |
 | `agy`      | `~/.gemini/antigravity-cli/` (metadata, history, db) | `agy --conversation <id>`                 |
 | `omp`      | `~/.omp/agent/sessions/*/*.jsonl`                    | `omp --resume <file>`                     |
@@ -45,7 +46,7 @@ whose size or time changed. Seance's own reads never wake it (SQLite `-shm` file
 open/close events are ignored); idle, it uses no measurable CPU. `● live` in the header
 shows the watches are on; ^R still rescans everything.
 
-`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_SESSION_DIR` and
+`CLAUDE_CONFIG_DIR`, `CLAURST_HOME`, `CODEX_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_SESSION_DIR` and
 `XDG_DATA_HOME` are honoured. seance only ever reads these files and databases (SQLite is
 opened read-only). Parsed file sessions are cached in `~/.cache/seance/index.json` by size
 and modification time, so a rescan only reads what changed.

@@ -39,7 +39,7 @@ use crate::{
     name = "seance",
     version,
     about = "Pick up any coding agent's session where you left it, or start a new one",
-    after_help = "Agents: claude codex agy omp pi hermes fx goose opencode sparkle sd\n\
+    after_help = "Agents: claude claurst codex agy omp pi hermes fx goose opencode sparkle sd\n\
                   Config: ~/.config/seance/config.toml    Logs: journalctl -t seance\n\n\
                   Shell integration (stay in the session's folder after the agent exits):\n  \
                   sea() { local c; c=$(seance --print \"$@\") && eval \"$c\"; }"

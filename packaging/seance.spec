@@ -16,7 +16,7 @@ BuildRequires:  gcc
 Recommends:     wl-clipboard
 
 %description
-seance lists the sessions that coding agents leave behind (Claude Code, Codex,
+seance lists the sessions that coding agents leave behind (Claude Code, Claurst, Codex,
 Antigravity, oh-my-pi, pi, Hermes, fx, goose, OpenCode, sparkle and sd) in one
 filterable terminal picker with a live preview of each conversation. Enter resumes
 a session in its own folder; the new-session menu starts any installed agent here
@@ -38,6 +38,9 @@ install -Dpm 0755 target/rpm/release/seance %{buildroot}%{_bindir}/seance
 %{_bindir}/seance
 
 %changelog
+* Tue Nov 24 2026 kernelzeroday - 0.1.4-1
+- Claurst sessions: snapshot plus journal replay, live updates, claurst --resume.
+
 * Tue Nov 24 2026 kernelzeroday - 0.1.3-1
 - Live updates with inotify: new and changed sessions appear without polling, and the
   open preview streams new messages; redraws only when something changes.

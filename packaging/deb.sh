@@ -59,7 +59,7 @@ Recommends: wl-clipboard | xclip | xsel
 Section: utils
 Priority: optional
 Description: one picker for every coding agent's sessions
- seance lists the sessions that coding agents leave behind (Claude Code, Codex,
+ seance lists the sessions that coding agents leave behind (Claude Code, Claurst, Codex,
  Antigravity, oh-my-pi, pi, Hermes, fx, goose, OpenCode, sparkle and sd) in one
  filterable terminal picker with a live preview of each conversation. Enter
  resumes a session in its own folder; the new-session menu starts any installed
