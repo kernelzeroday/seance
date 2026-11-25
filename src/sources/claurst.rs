@@ -162,17 +162,14 @@ fn parse(id_path: &Path) -> Option<Session> {
         .and_then(Value::as_str)
         .filter(|t| !t.trim().is_empty())
         .map(titleize);
+    // `updated_at` only moves when a turn ends; while Claurst works, only the journal
+    // grows. Its last write is the live signal.
     let updated = meta
         .get("updated_at")
         .and_then(Value::as_str)
         .and_then(crate::text::parse_iso)
-        .unwrap_or_else(|| {
-            files(id_path)
-                .iter()
-                .map(|p| mtime_secs(p))
-                .max()
-                .unwrap_or(0)
-        });
+        .unwrap_or(0)
+        .max(mtime_secs(&id_path.with_extension("jsonl")));
     Some(Session {
         agent: Agent::Claurst,
         prompt: if title.is_some() {

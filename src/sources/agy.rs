@@ -67,12 +67,14 @@ pub fn scan() -> Result<Vec<Session>> {
                 .and_then(|w| w.get(0))
                 .and_then(Value::as_str)
                 .map(|u| PathBuf::from(u.trim_start_matches("file://")));
+            let db = conv_dir.join(format!("{id}.db"));
+            // The summary cache lags the conversation; its database's writes do not.
             let updated = s
                 .get("UpdatedAt")
                 .and_then(Value::as_str)
                 .and_then(crate::text::parse_iso)
-                .unwrap_or(0);
-            let db = conv_dir.join(format!("{id}.db"));
+                .unwrap_or(0)
+                .max(db_mtime(&db));
             seen.insert(id.clone());
             sessions.push(Session {
                 agent: Agent::Agy,
@@ -113,11 +115,7 @@ pub fn scan() -> Result<Vec<Session>> {
                 title: titleize(&prompts[0].1),
                 prompt: String::new(),
                 cwd: prompts.iter().find_map(|p| p.2.clone()).map(PathBuf::from),
-                updated: prompts
-                    .last()
-                    .map(|p| p.0)
-                    .filter(|t| *t > 0)
-                    .unwrap_or_else(|| mtime_secs(&p)),
+                updated: prompts.last().map(|p| p.0).unwrap_or(0).max(db_mtime(&p)),
                 messages: prompts.len(),
                 model: None,
                 branch: None,
@@ -127,6 +125,13 @@ pub fn scan() -> Result<Vec<Session>> {
         }
     }
     Ok(sessions)
+}
+
+/// The last write to a conversation database, its write-ahead log included.
+fn db_mtime(db: &std::path::Path) -> i64 {
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    mtime_secs(db).max(mtime_secs(std::path::Path::new(&wal)))
 }
 
 // ---------------------------------------------------------------------------------------------

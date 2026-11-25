@@ -52,7 +52,12 @@ pub fn scan() -> Result<Vec<Session>> {
             .to_string();
         let mut model = None;
         let mut first = String::new();
+        // The index is written once per turn; every log line has its own time.
+        let mut last_ts = v.get("updated").and_then(Value::as_i64).unwrap_or(0);
         let _ = each_json_line(&log, |_, e| {
+            if let Some(ts) = e.get("ts").and_then(Value::as_i64) {
+                last_ts = last_ts.max(ts);
+            }
             match (
                 e.get("kind").and_then(Value::as_str),
                 e.get("type").and_then(Value::as_str),
@@ -90,7 +95,7 @@ pub fn scan() -> Result<Vec<Session>> {
                 .get("workspace")
                 .and_then(Value::as_str)
                 .map(PathBuf::from),
-            updated: v.get("updated").and_then(Value::as_i64).unwrap_or(0) / 1000,
+            updated: last_ts / 1000,
             messages: turns as usize * 2,
             model,
             branch: None,

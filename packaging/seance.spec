@@ -38,6 +38,10 @@ install -Dpm 0755 target/rpm/release/seance %{buildroot}%{_bindir}/seance
 %{_bindir}/seance
 
 %changelog
+* Wed Nov 25 2026 kernelzeroday - 0.1.5-1
+- Live updates keep the cursor on the selected session instead of drifting; active
+  claurst, agy and fx sessions now move to the top while they are working.
+
 * Tue Nov 24 2026 kernelzeroday - 0.1.4-1
 - Claurst sessions: snapshot plus journal replay, live updates, claurst --resume.
 

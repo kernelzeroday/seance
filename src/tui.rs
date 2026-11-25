@@ -170,8 +170,12 @@ struct App {
     got_rx: Receiver<(Key, Result<Vec<Turn>, String>)>,
     plan: Option<Plan>,
     quit: bool,
-    /// Set once the user moves the cursor; until then new scan results keep it on top.
+    /// Set once the user moves the cursor; until then (and until the first scan is done)
+    /// new scan results keep it on the top row.
     touched: bool,
+    /// The first full scan has finished: from then on the cursor always stays on the same
+    /// session while live updates reorder the list.
+    settled: bool,
     /// The last Ctrl+C / Ctrl+D and when, so a second one in time quits.
     quit_armed: Option<(char, Instant)>,
 }
@@ -225,6 +229,7 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
         plan: None,
         quit: false,
         touched: false,
+        settled: false,
         quit_armed: None,
     };
     app.rescan();
@@ -343,6 +348,9 @@ impl App {
         let mut act = self.pump_live();
         let mut changed = false;
         let mut updated: Vec<Session> = Vec::new();
+        // Which session is selected, read before the scan results below rebuild
+        // `self.sessions`: afterwards the cursor's index points at a different session.
+        let shown = self.selected().map(key);
         while let Ok((agent, r)) = self.scan_rx.try_recv() {
             act = true;
             self.scanning = self.scanning.saturating_sub(1);
@@ -369,7 +377,6 @@ impl App {
             }
         }
         if !updated.is_empty() {
-            let shown = self.selected().map(key);
             for s in updated {
                 let k = key(&s);
                 if Some(&k) == shown.as_ref() {
@@ -386,8 +393,7 @@ impl App {
             }
         }
         if changed {
-            let keep = self.selected().filter(|_| self.touched).map(key);
-            let was = self.selected().map(key);
+            let keep = shown.clone().filter(|_| self.touched || self.settled);
             let scroll = self.preview_scroll;
             self.sessions.sort_by_key(|s| std::cmp::Reverse(s.updated));
             self.refilter();
@@ -407,8 +413,11 @@ impl App {
                 }
             }
             // Same session still shown: a live update must not yank the preview's scroll.
-            if self.selected().map(key) == was {
+            if self.selected().map(key) == shown {
                 self.preview_scroll = scroll;
+            }
+            if self.scanning == 0 {
+                self.settled = true;
             }
             // Stale previews of sessions that changed on disk.
             self.previews
