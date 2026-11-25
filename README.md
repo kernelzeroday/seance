@@ -59,6 +59,18 @@ prompts, the assistant's prose and the tool calls it can read from them.
 | ^E             | copy the resume command                                        |
 | ^R             | rescan                                                         |
 | Esc            | clear the filter, then quit                                    |
+| ^C ^C, ^D ^D   | quit (press twice quickly; the first ^C also clears the filter) |
+
+### Mouse
+
+The mouse is captured by default, so it works like the keyboard: click a tab or a session
+to select it, double-click to resume (or to open / choose in the menus), and scroll the list,
+the preview or a menu with the wheel. **Dragging in the preview selects text and copies it on
+release** — only the conversation, not the borders, gutters or the session list next to it,
+with wrapped lines joined back together. Double-click a message to copy all of it. Copies go
+through `wl-copy` (or `xclip`/`xsel`, or OSC 52). `mouse = false` in the config or
+`--no-mouse` gives the mouse back to the terminal; most terminals also bypass the capture
+while Shift is held.
 
 In the folder browser: Enter opens a folder (or chooses **✓ start here**), → / ← go in and
 up, Backspace on an empty filter goes up, Tab switches to the folders recent sessions ran
@@ -68,7 +80,7 @@ as `~/src/x` then Enter jumps there.
 ## Command line
 
 ```
-seance [FILTER…]          open the picker (-a AGENT opens one tab, -H only this folder, -n new-session menu)
+seance [FILTER…]          open the picker (-a AGENT one tab, -H only this folder, -n new-session menu, --no-mouse)
 seance list [-a AGENT] [-H] [-n N] [--json]
 seance show ID [--copy]   print a session's conversation, or copy it
 seance resume ID          resume by id (a unique prefix is enough)
@@ -92,6 +104,7 @@ Without `--print`, seance replaces itself with the agent (`exec`) in the session
 ```toml
 hide = ["sd"]                 # agents left out of the list and the new-session menu
 preview = true                # show the preview pane on start
+mouse = true                  # clicks, wheel and drag-to-copy; false leaves the mouse to the terminal
 
 [agents.claude]
 command = "claude"            # program to run

@@ -38,6 +38,12 @@ install -Dpm 0755 target/rpm/release/seance %{buildroot}%{_bindir}/seance
 %{_bindir}/seance
 
 %changelog
+* Tue Nov 24 2026 kernelzeroday - 0.1.2-1
+- Ctrl+C / Ctrl+D must be pressed twice in quick succession to quit; the first
+  Ctrl+C clears the filter.
+- Mouse capture by default: click and double-click tabs, sessions and menu rows, wheel
+  scrolling, and drag-to-copy of preview text only (double-click copies a message).
+
 * Tue Nov 24 2026 kernelzeroday - 0.1.1-1
 - ^Y copies the previewed conversation with wl-copy (xclip/xsel, OSC 52 fallback);
   ^E copies the resume command; seance show --copy.

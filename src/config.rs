@@ -3,6 +3,7 @@
 //! ```toml
 //! hide = ["sd"]                 # agents left out of the list and the new-session menu
 //! preview = true                # show the preview pane on start
+//! mouse = true                  # clicks, wheel and drag-to-copy (false: terminal selection)
 //!
 //! [agents.claude]
 //! command = "claude"            # program to run (a name on PATH or a full path)
@@ -20,6 +21,8 @@ use crate::model::Agent;
 pub struct Config {
     pub hide: Vec<String>,
     pub preview: Option<bool>,
+    /// Capture the mouse (default true); false leaves selection to the terminal.
+    pub mouse: Option<bool>,
     pub agents: HashMap<String, AgentConfig>,
 }
 

@@ -2,6 +2,7 @@
 //! session, and the new-session flow (agent menu, then an optional folder browser).
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
@@ -12,10 +13,13 @@ use std::{
 };
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Clear, Paragraph},
@@ -27,6 +31,7 @@ use crate::{
     folders::{self, Browser, Row},
     launch::{self, Plan},
     model::{Agent, Role, Session, Turn},
+    select::{self, PLine, Pos},
     sources::{self, FileCache},
     text::{ago, fit, now, one_line, tilde, wrap},
 };
@@ -36,8 +41,15 @@ const DIM: Color = Color::Rgb(120, 124, 140);
 const FAINT: Color = Color::Rgb(70, 72, 84);
 const SELECT_BG: Color = Color::Rgb(40, 41, 54);
 const TEXT: Color = Color::Rgb(220, 222, 230);
+/// Mouse-selected preview text.
+const SELECT_TEXT_BG: Color = Color::Rgb(90, 70, 110);
 
 type Key = (Agent, String);
+
+/// Ctrl+C / Ctrl+D must be pressed twice within this long to quit.
+const QUIT_WINDOW: Duration = Duration::from_millis(1500);
+/// How long an ordinary notice stays in the footer.
+const NOTICE_TTL: Duration = Duration::from_secs(6);
 
 fn key(s: &Session) -> Key {
     (s.agent, s.id.clone())
@@ -51,6 +63,8 @@ pub struct Start {
     /// Open straight into the new-session menu.
     pub new: bool,
     pub launch_dir: PathBuf,
+    /// Capture the mouse (clicks, wheel, drag-to-copy in the preview).
+    pub mouse: bool,
 }
 
 enum Overlay {
@@ -84,6 +98,30 @@ enum Preview {
     Failed(String),
 }
 
+/// Where the last frame put things, for mapping mouse positions back to them.
+#[derive(Default, Clone)]
+struct Hits {
+    tabs: Vec<(Rect, Option<Agent>)>,
+    /// The session rows (two screen lines each) and the first row shown.
+    list: Rect,
+    list_top: usize,
+    /// The whole preview pane, and the transcript part of it.
+    preview: Rect,
+    body: Rect,
+    body_lines: usize,
+    /// An open menu's frame, its rows, and the index of the first row shown.
+    overlay: Option<Rect>,
+    rows: Option<(Rect, usize)>,
+}
+
+/// A drag selection in the preview, tied to the session it was made in.
+struct Sel {
+    key: Key,
+    anchor: Pos,
+    head: Pos,
+    dragging: bool,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Tone {
     Info,
@@ -106,9 +144,12 @@ struct App {
     previews: HashMap<Key, Preview>,
     /// Lines scrolled up from the bottom of the preview.
     preview_scroll: usize,
-    preview_lines: Option<(Key, u16, Arc<Vec<Line<'static>>>)>,
+    preview_lines: Option<(Key, u16, Arc<Vec<PLine>>)>,
+    hits: RefCell<Hits>,
+    sel: Option<Sel>,
+    last_click: Option<(Instant, u16, u16)>,
     overlay: Option<Overlay>,
-    status: Option<(String, Tone, Instant)>,
+    status: Option<(String, Tone, Instant, Duration)>,
     scanning: usize,
     scan_rx: Receiver<(Agent, Result<Vec<Session>, String>)>,
     scan_tx: Sender<(Agent, Result<Vec<Session>, String>)>,
@@ -118,6 +159,8 @@ struct App {
     quit: bool,
     /// Set once the user moves the cursor; until then new scan results keep it on top.
     touched: bool,
+    /// The last Ctrl+C / Ctrl+D and when, so a second one in time quits.
+    quit_armed: Option<(char, Instant)>,
 }
 
 pub fn run(start: Start) -> Result<Option<Plan>> {
@@ -145,6 +188,9 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
         previews: HashMap::new(),
         preview_scroll: 0,
         preview_lines: None,
+        hits: RefCell::default(),
+        sel: None,
+        last_click: None,
         overlay: None,
         status: None,
         scanning: 0,
@@ -155,6 +201,7 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
         plan: None,
         quit: false,
         touched: false,
+        quit_armed: None,
     };
     app.rescan();
     if start.new {
@@ -162,7 +209,7 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
     }
 
     // Draw on stderr so stdout stays free for `--print` (`eval "$(seance --print)"`).
-    let mut terminal = init_terminal()?;
+    let mut terminal = init_terminal(start.mouse)?;
     let result = (|| -> Result<()> {
         while !app.quit {
             app.pump();
@@ -170,6 +217,7 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
             if event::poll(Duration::from_millis(60))? {
                 match event::read()? {
                     Event::Key(k) if k.kind != KeyEventKind::Release => app.key(k),
+                    Event::Mouse(m) => app.mouse(m),
                     Event::Paste(s) => {
                         for c in s.chars().filter(|c| !c.is_control()) {
                             app.type_char(c);
@@ -282,8 +330,8 @@ impl App {
             self.previews.insert(key(&s), Preview::Loading);
             let _ = self.want_tx.send(s);
         }
-        if let Some((_, _, t)) = &self.status
-            && t.elapsed() > Duration::from_secs(6)
+        if let Some((_, _, t, ttl)) = &self.status
+            && t.elapsed() > *ttl
         {
             self.status = None;
         }
@@ -357,7 +405,7 @@ impl App {
     }
 
     fn notice(&mut self, msg: impl Into<String>, tone: Tone) {
-        self.status = Some((msg.into(), tone, Instant::now()));
+        self.status = Some((msg.into(), tone, Instant::now(), NOTICE_TTL));
     }
 
     fn type_char(&mut self, c: char) {
@@ -457,6 +505,245 @@ impl App {
         self.quit = true;
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Mouse
+
+    fn mouse(&mut self, m: MouseEvent) {
+        let (x, y) = (m.column, m.row);
+        let hits = self.hits.borrow().clone();
+        let at = Position { x, y };
+        match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let d: isize = if m.kind == MouseEventKind::ScrollUp {
+                    -1
+                } else {
+                    1
+                };
+                match &mut self.overlay {
+                    Some(Overlay::Agents(menu)) => {
+                        let n = menu.visible().len() as isize;
+                        menu.cursor = (menu.cursor as isize + d).clamp(0, (n - 1).max(0)) as usize;
+                    }
+                    Some(Overlay::Folder { browser, .. }) => browser.move_by(d),
+                    Some(Overlay::Help) => {}
+                    None if hits.preview.contains(at) => {
+                        self.preview_scroll = if d < 0 {
+                            self.preview_scroll + 3
+                        } else {
+                            self.preview_scroll.saturating_sub(3)
+                        };
+                    }
+                    None => self.select_row(self.cursor as isize + d),
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let double = self.last_click.is_some_and(|(t, cx, cy)| {
+                    t.elapsed() < Duration::from_millis(400) && cy == y && cx.abs_diff(x) <= 1
+                });
+                self.last_click = Some((Instant::now(), x, y));
+                if self.overlay.is_some() {
+                    return self.click_overlay(at, double, &hits);
+                }
+                if let Some((_, tab)) = hits.tabs.iter().find(|(r, _)| r.contains(at)) {
+                    self.tab = *tab;
+                    self.cursor = 1;
+                    self.list_top = 0;
+                    self.refilter();
+                    return;
+                }
+                if hits.list.contains(at) {
+                    let idx = hits.list_top + ((y - hits.list.y) / 2) as usize;
+                    if idx <= self.visible.len() {
+                        if double && idx == self.cursor {
+                            self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                        } else {
+                            self.select_row(idx as isize);
+                        }
+                    }
+                    return;
+                }
+                if hits.body.contains(at)
+                    && let Some(k) = self.selected().map(key)
+                {
+                    let pos = self.preview_pos(&hits, x, y);
+                    if double {
+                        self.select_turn(k, pos.0);
+                    } else {
+                        self.sel = Some(Sel {
+                            key: k,
+                            anchor: pos,
+                            head: pos,
+                            dragging: true,
+                        });
+                    }
+                    return;
+                }
+                self.sel = None;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if !self.sel.as_ref().is_some_and(|s| s.dragging) || hits.body.height == 0 {
+                    return;
+                }
+                // Dragging past the top or bottom scrolls the transcript along.
+                let body = hits.body;
+                if y < body.y {
+                    self.preview_scroll += 1;
+                } else if y >= body.y + body.height {
+                    self.preview_scroll = self.preview_scroll.saturating_sub(1);
+                }
+                let max_scroll = hits.body_lines.saturating_sub(body.height as usize);
+                self.preview_scroll = self.preview_scroll.min(max_scroll);
+                let yy = y.clamp(body.y, body.y + body.height - 1);
+                let xx = x.clamp(body.x, body.x + body.width.saturating_sub(1));
+                let pos = self.preview_pos(&hits, xx, yy);
+                if let Some(sel) = &mut self.sel {
+                    sel.head = pos;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(sel) = &mut self.sel else { return };
+                if !sel.dragging {
+                    return;
+                }
+                sel.dragging = false;
+                if sel.anchor == sel.head {
+                    // A plain click: no selection.
+                    self.sel = None;
+                } else {
+                    self.copy_selection();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The transcript position under screen cell (x, y) of the preview body.
+    fn preview_pos(&self, hits: &Hits, x: u16, y: u16) -> Pos {
+        let h = hits.body.height as usize;
+        let scroll = self.preview_scroll.min(hits.body_lines.saturating_sub(h));
+        let start = hits.body_lines.saturating_sub(h + scroll);
+        let line =
+            (start + y.saturating_sub(hits.body.y) as usize).min(hits.body_lines.saturating_sub(1));
+        (line, x.saturating_sub(hits.body.x))
+    }
+
+    fn select_row(&mut self, idx: isize) {
+        let rows = self.visible.len() + 1;
+        self.touched = true;
+        self.sel = None;
+        let idx = idx.clamp(0, rows as isize - 1) as usize;
+        if idx != self.cursor {
+            self.preview_scroll = 0;
+        }
+        self.cursor = idx;
+    }
+
+    fn select_turn(&mut self, k: Key, line: usize) {
+        let Some((_, _, lines)) = &self.preview_lines else {
+            return;
+        };
+        if let Some((a, b)) = select::turn_span(lines, line) {
+            self.sel = Some(Sel {
+                key: k,
+                anchor: a,
+                head: b,
+                dragging: false,
+            });
+            self.copy_selection();
+        }
+    }
+
+    fn copy_selection(&mut self) {
+        let (Some(sel), Some((pk, _, lines))) = (&self.sel, &self.preview_lines) else {
+            return;
+        };
+        if *pk != sel.key {
+            return;
+        }
+        let text = select::extract(lines, sel.anchor, sel.head);
+        if text.is_empty() {
+            return;
+        }
+        let n = text.lines().count();
+        match crate::clipboard::copy(&text) {
+            Ok(via) => self.notice(
+                format!("copied {n} line{} via {via}", if n == 1 { "" } else { "s" }),
+                Tone::Info,
+            ),
+            Err(e) => self.notice(format!("copy failed: {e:#}"), Tone::Bad),
+        }
+    }
+
+    fn click_overlay(&mut self, at: Position, double: bool, hits: &Hits) {
+        if matches!(self.overlay, Some(Overlay::Help)) {
+            self.overlay = None;
+            return;
+        }
+        // A click outside the menu closes it.
+        if hits.overlay.is_some_and(|r| !r.contains(at)) {
+            self.overlay = None;
+            return;
+        }
+        let Some((rows, top)) = hits.rows else { return };
+        if !rows.contains(at) {
+            return;
+        }
+        let idx = top + (at.y - rows.y) as usize;
+        let hit = match &mut self.overlay {
+            Some(Overlay::Agents(menu)) if idx < menu.visible().len() => {
+                let same = menu.cursor == idx;
+                menu.cursor = idx;
+                same
+            }
+            Some(Overlay::Folder { browser, .. }) if idx < browser.rows().len() => {
+                let same = browser.cursor == idx;
+                browser.cursor = idx;
+                same
+            }
+            _ => return,
+        };
+        if double && hit {
+            self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+    }
+
+    /// Quit on the second Ctrl+C (or Ctrl+D) in quick succession; the first one only says so.
+    fn quit_key(&mut self, ch: char) {
+        if self
+            .quit_armed
+            .is_some_and(|(prev, at)| prev == ch && at.elapsed() < QUIT_WINDOW)
+        {
+            self.quit = true;
+            return;
+        }
+        self.quit_armed = Some((ch, Instant::now()));
+        let key = ch.to_ascii_uppercase();
+        self.status = Some((
+            format!("press Ctrl+{key} again to quit"),
+            Tone::Info,
+            Instant::now(),
+            QUIT_WINDOW,
+        ));
+    }
+
+    /// Clears the filter of whatever has focus: an overlay's, or the list's.
+    fn clear_filter(&mut self) {
+        match &mut self.overlay {
+            Some(Overlay::Agents(m)) => {
+                m.filter.clear();
+                m.cursor = 0;
+            }
+            Some(Overlay::Folder { browser, .. }) => browser.clear_filter(),
+            Some(Overlay::Help) => {}
+            None => {
+                if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.refilter();
+                }
+            }
+        }
+    }
+
     fn copy_command(&mut self) {
         let Some(s) = self.selected() else { return };
         let cmd = launch::resume(&self.cfg, s, &self.launch_dir).shell();
@@ -497,9 +784,12 @@ impl App {
 
     fn key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && matches!(k.code, KeyCode::Char('c')) {
-            self.quit = true;
-            return;
+        if ctrl && let KeyCode::Char(ch @ ('c' | 'd')) = k.code {
+            // Like a shell: the first Ctrl+C clears what you typed.
+            if ch == 'c' {
+                self.clear_filter();
+            }
+            return self.quit_key(ch);
         }
         match self.overlay.take() {
             Some(Overlay::Help) => {}
@@ -592,6 +882,7 @@ impl App {
         let rows = self.visible.len() + 1;
         let move_to = |app: &mut App, c: isize| {
             app.touched = true;
+            app.sel = None;
             app.cursor = c.clamp(0, rows as isize - 1) as usize;
             app.preview_scroll = 0;
         };
@@ -680,6 +971,7 @@ impl App {
     // Drawing
 
     fn draw(&mut self, f: &mut Frame) {
+        *self.hits.borrow_mut() = Hits::default();
         let area = f.area();
         f.render_widget(Block::new().style(Style::default().fg(TEXT)), area);
         let [header, tabs, body, footer] = Layout::vertical([
@@ -711,7 +1003,10 @@ impl App {
         match &self.overlay {
             Some(Overlay::Agents(m)) => self.draw_agents(f, m),
             Some(Overlay::Folder { agent, browser }) => self.draw_folder(f, *agent, browser),
-            Some(Overlay::Help) => draw_help(f),
+            Some(Overlay::Help) => {
+                draw_help(f);
+                self.hits.borrow_mut().overlay = Some(f.area());
+            }
             None => {}
         }
     }
@@ -780,7 +1075,22 @@ impl App {
         if first > 0 {
             spans[0] = Span::styled("‹", Style::default().fg(DIM));
         }
+        let mut x = area.x + 1;
         for (i, (label, a)) in labels.iter().enumerate().skip(first) {
+            let lw = label.width() as u16;
+            if x < area.x + area.width {
+                let width = lw.min(area.x + area.width - x);
+                self.hits.borrow_mut().tabs.push((
+                    Rect {
+                        x,
+                        y: area.y,
+                        width,
+                        height: 1,
+                    },
+                    *a,
+                ));
+            }
+            x = x.saturating_add(lw + 1);
             let color = a.map(|a| a.color()).unwrap_or(ACCENT);
             let style = if i == active {
                 Style::default().fg(Color::Black).bg(color).bold()
@@ -831,6 +1141,11 @@ impl App {
             self.list_top = self.cursor;
         } else if self.cursor >= self.list_top + per_page {
             self.list_top = self.cursor + 1 - per_page;
+        }
+        {
+            let mut h = self.hits.borrow_mut();
+            h.list = list;
+            h.list_top = self.list_top;
         }
         let now = now();
         let w = list.width as usize;
@@ -953,6 +1268,7 @@ impl App {
             .border_style(Style::default().fg(FAINT));
         let inner = block.inner(area).inner(ratatui::layout::Margin::new(1, 0));
         f.render_widget(block, area);
+        self.hits.borrow_mut().preview = area;
         let Some(s) = self.selected().cloned() else {
             let lines = vec![
                 Line::raw(""),
@@ -1033,30 +1349,62 @@ impl App {
             return;
         }
         let k = key(&s);
+        let note = |text: String, color: Color| {
+            Arc::new(vec![PLine {
+                line: Line::from(Span::styled(text, Style::default().fg(color))),
+                text: String::new(),
+                gutter: 0,
+                width: 0,
+                soft: false,
+                turn: 0,
+                header: false,
+            }])
+        };
         let lines = match self.previews.get(&k) {
             Some(Preview::Ready(turns)) => match &self.preview_lines {
                 Some((pk, pw, l)) if *pk == k && *pw == body.width => l.clone(),
                 _ => {
                     let l = Arc::new(render_turns(turns, &s, body.width as usize));
-                    self.preview_lines = Some((k, body.width, l.clone()));
+                    self.preview_lines = Some((k.clone(), body.width, l.clone()));
+                    // A new layout invalidates any selection made on the old one.
+                    self.sel = None;
                     l
                 }
             },
-            Some(Preview::Failed(e)) => Arc::new(vec![Line::from(Span::styled(
-                format!("can't read this session: {e}"),
-                Style::default().fg(Color::Red),
-            ))]),
-            _ => Arc::new(vec![Line::from(Span::styled(
-                "loading…",
-                Style::default().fg(DIM),
-            ))]),
+            Some(Preview::Failed(e)) => note(format!("can't read this session: {e}"), Color::Red),
+            _ => note("loading…".into(), DIM),
         };
+        if self.sel.as_ref().is_some_and(|sel| sel.key != k) {
+            self.sel = None;
+        }
         let h = body.height as usize;
         let max_scroll = lines.len().saturating_sub(h);
         self.preview_scroll = self.preview_scroll.min(max_scroll);
         let start = lines.len().saturating_sub(h + self.preview_scroll);
-        let shown: Vec<Line> = lines.iter().skip(start).take(h).cloned().collect();
+        let shown: Vec<Line> = lines
+            .iter()
+            .skip(start)
+            .take(h)
+            .map(|l| l.line.clone())
+            .collect();
         f.render_widget(Paragraph::new(shown), body);
+        if let Some(sel) = &self.sel {
+            for i in start..(start + h).min(lines.len()) {
+                if let Some((c0, c1)) = select::highlight(&lines, sel.anchor, sel.head, i) {
+                    let y = body.y + (i - start) as u16;
+                    for c in c0..c1.min(body.width) {
+                        if let Some(cell) = f.buffer_mut().cell_mut((body.x + c, y)) {
+                            cell.set_bg(SELECT_TEXT_BG).set_fg(Color::White);
+                        }
+                    }
+                }
+            }
+        }
+        {
+            let mut hits = self.hits.borrow_mut();
+            hits.body = body;
+            hits.body_lines = lines.len();
+        }
         if self.preview_scroll > 0 {
             let tag = format!(" ↑{} ", self.preview_scroll);
             let x = area.x + area.width.saturating_sub(tag.width() as u16 + 2);
@@ -1073,7 +1421,7 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        if let Some((msg, tone, _)) = &self.status {
+        if let Some((msg, tone, _, _)) = &self.status {
             let color = if *tone == Tone::Bad {
                 Color::Red
             } else {
@@ -1107,7 +1455,8 @@ impl App {
                 ("⇥", "agent"),
                 ("^O", "here only"),
                 ("PgUp/Dn", "scroll"),
-                ("^Y", "copy"),
+                ("drag", "copy"),
+                ("^Y", "copy all"),
                 ("^V", "preview"),
                 ("?", "help"),
             ],
@@ -1136,6 +1485,16 @@ impl App {
             .title(Span::styled(title, Style::default().fg(ACCENT).bold()));
         let inner = block.inner(area);
         f.render_widget(block, area);
+        {
+            let mut hits = self.hits.borrow_mut();
+            hits.overlay = Some(area);
+            let rows = Rect {
+                y: inner.y + 2,
+                height: inner.height.saturating_sub(2),
+                ..inner
+            };
+            hits.rows = Some((rows, 0));
+        }
         let mut lines = vec![Line::from(vec![
             Span::styled(" ⌕ ", Style::default().fg(ACCENT)),
             if m.filter.is_empty() {
@@ -1260,6 +1619,16 @@ impl App {
         }
         let room = (inner.height as usize).saturating_sub(lines.len());
         let top = b.cursor.saturating_sub(room.saturating_sub(1));
+        {
+            let mut hits = self.hits.borrow_mut();
+            hits.overlay = Some(area);
+            let rows = Rect {
+                y: inner.y + lines.len() as u16,
+                height: room as u16,
+                ..inner
+            };
+            hits.rows = Some((rows, top));
+        }
         for (i, row) in b.rows().iter().enumerate().skip(top).take(room) {
             let sel = i == b.cursor;
             let (icon, text, color) = match row {
@@ -1298,9 +1667,9 @@ impl App {
 
 type Term = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stderr>>;
 
-fn init_terminal() -> Result<Term> {
+fn init_terminal(mouse: bool) -> Result<Term> {
     use crossterm::{
-        event::EnableBracketedPaste,
+        event::{EnableBracketedPaste, EnableMouseCapture},
         execute,
         terminal::{EnterAlternateScreen, enable_raw_mode},
     };
@@ -1316,6 +1685,9 @@ fn init_terminal() -> Result<Term> {
         EnterAlternateScreen,
         EnableBracketedPaste
     )?;
+    if mouse {
+        execute!(std::io::stderr(), EnableMouseCapture)?;
+    }
     Ok(ratatui::Terminal::new(
         ratatui::backend::CrosstermBackend::new(std::io::stderr()),
     )?)
@@ -1324,7 +1696,7 @@ fn init_terminal() -> Result<Term> {
 fn restore_terminal() {
     use crossterm::{
         cursor::Show,
-        event::DisableBracketedPaste,
+        event::{DisableBracketedPaste, DisableMouseCapture},
         execute,
         terminal::{LeaveAlternateScreen, disable_raw_mode},
     };
@@ -1332,6 +1704,7 @@ fn restore_terminal() {
     let _ = execute!(
         std::io::stderr(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen,
         Show
     );
@@ -1348,37 +1721,85 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
-/// The transcript as styled, pre-wrapped lines.
-fn render_turns(turns: &[Turn], s: &Session, width: usize) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
+/// The transcript as styled, pre-wrapped lines that remember their plain text for copying.
+fn render_turns(turns: &[Turn], s: &Session, width: usize) -> Vec<PLine> {
+    let mut out: Vec<PLine> = Vec::new();
     let body_w = width.saturating_sub(2);
-    for t in turns {
+    // One screen line: `gutter` is the decoration span, `text` what it shows and copies.
+    let push = |out: &mut Vec<PLine>,
+                gutter: Span<'static>,
+                text: String,
+                copy: String,
+                style: Style,
+                soft: bool,
+                turn: usize,
+                header: bool| {
+        let g = gutter.content.width() as u16;
+        let w = g + text.width() as u16;
+        out.push(PLine {
+            line: Line::from(vec![gutter, Span::styled(text, style)]),
+            text: copy,
+            gutter: g,
+            width: w,
+            soft,
+            turn,
+            header,
+        });
+    };
+    for (n, t) in turns.iter().enumerate() {
         match t.role {
             Role::User => {
-                out.push(Line::from(Span::styled(
-                    "› you",
+                push(
+                    &mut out,
+                    Span::styled("› ", Style::default().fg(ACCENT).bold()),
+                    "you".into(),
+                    "you".into(),
                     Style::default().fg(ACCENT).bold(),
-                )));
-                for l in wrap(&t.text, body_w) {
-                    out.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(ACCENT)),
-                        Span::styled(l, Style::default().fg(Color::White)),
-                    ]));
+                    false,
+                    n,
+                    true,
+                );
+                for raw in t.text.lines() {
+                    for (j, l) in wrap(raw, body_w).into_iter().enumerate() {
+                        push(
+                            &mut out,
+                            Span::styled("│ ", Style::default().fg(ACCENT)),
+                            l.clone(),
+                            l,
+                            Style::default().fg(Color::White),
+                            j > 0,
+                            n,
+                            false,
+                        );
+                    }
                 }
             }
             Role::Assistant => {
-                out.push(Line::from(Span::styled(
-                    format!("● {}", s.agent.key()),
-                    Style::default().fg(s.agent.color()).bold(),
-                )));
+                let color = s.agent.color();
+                push(
+                    &mut out,
+                    Span::styled("● ", Style::default().fg(color).bold()),
+                    s.agent.key().into(),
+                    s.agent.key().into(),
+                    Style::default().fg(color).bold(),
+                    false,
+                    n,
+                    true,
+                );
                 let mut in_code = false;
-                for l in wrap(&t.text, body_w) {
-                    if l.trim_start().starts_with("```") {
+                for raw in t.text.lines() {
+                    if raw.trim_start().starts_with("```") {
                         in_code = !in_code;
-                        out.push(Line::from(Span::styled(
-                            format!("  {l}"),
+                        push(
+                            &mut out,
+                            Span::raw("  "),
+                            raw.to_string(),
+                            raw.to_string(),
                             Style::default().fg(FAINT),
-                        )));
+                            false,
+                            n,
+                            false,
+                        );
                         continue;
                     }
                     let style = if in_code {
@@ -1386,42 +1807,90 @@ fn render_turns(turns: &[Turn], s: &Session, width: usize) -> Vec<Line<'static>>
                     } else {
                         Style::default().fg(TEXT)
                     };
-                    out.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(markdownish(&l), style),
-                    ]));
+                    let shown = if in_code {
+                        raw.to_string()
+                    } else {
+                        markdownish(raw)
+                    };
+                    for (j, l) in wrap(&shown, body_w).into_iter().enumerate() {
+                        push(
+                            &mut out,
+                            Span::raw("  "),
+                            l.clone(),
+                            l,
+                            style,
+                            j > 0,
+                            n,
+                            false,
+                        );
+                    }
                 }
             }
             Role::Tool => {
                 let lines: Vec<&str> = t.text.lines().collect();
                 let shown = lines.len().min(6);
                 for l in &lines[..shown] {
-                    out.push(Line::from(vec![
+                    push(
+                        &mut out,
                         Span::styled("  ⚙ ", Style::default().fg(FAINT)),
-                        Span::styled(fit(l, body_w.saturating_sub(2)), Style::default().fg(DIM)),
-                    ]));
+                        fit(l, body_w.saturating_sub(2)),
+                        l.to_string(),
+                        Style::default().fg(DIM),
+                        false,
+                        n,
+                        false,
+                    );
                 }
                 if lines.len() > shown {
-                    out.push(Line::from(Span::styled(
-                        format!("    … {} more tool calls", lines.len() - shown),
+                    let more = format!("… {} more tool calls", lines.len() - shown);
+                    push(
+                        &mut out,
+                        Span::raw("    "),
+                        more.clone(),
+                        more,
                         Style::default().fg(FAINT),
-                    )));
+                        false,
+                        n,
+                        false,
+                    );
                 }
             }
             Role::Info => {
-                out.push(Line::from(Span::styled(
-                    format!("  · {}", one_line(&t.text, body_w)),
+                let text = one_line(&t.text, body_w);
+                push(
+                    &mut out,
+                    Span::styled("  · ", Style::default().fg(FAINT)),
+                    text.clone(),
+                    t.text.clone(),
                     Style::default().fg(FAINT).add_modifier(Modifier::ITALIC),
-                )));
+                    false,
+                    n,
+                    false,
+                );
             }
         }
-        out.push(Line::raw(""));
+        push(
+            &mut out,
+            Span::raw(""),
+            String::new(),
+            String::new(),
+            Style::default(),
+            false,
+            n,
+            false,
+        );
     }
     if out.is_empty() {
-        out.push(Line::from(Span::styled(
-            "(no messages)",
+        push(
+            &mut out,
+            Span::raw(""),
+            "(no messages)".into(),
+            String::new(),
             Style::default().fg(DIM),
-        )));
+            false,
+            0,
+            false,
+        );
     }
     out
 }
@@ -1450,11 +1919,23 @@ fn draw_help(f: &mut Frame) {
         ("^O", "only sessions under the current folder"),
         ("PgUp PgDn", "scroll the preview (Shift+↑↓ by line)"),
         ("^V", "show or hide the preview"),
+        (
+            "mouse",
+            "click selects, double-click resumes, wheel scrolls",
+        ),
+        (
+            "drag",
+            "select preview text and copy it (double-click: a message)",
+        ),
         ("^Y", "copy the conversation (wl-copy, xclip/xsel, OSC 52)"),
         ("^E", "copy the resume command"),
         ("^R", "rescan"),
         ("^U", "clear the filter"),
         ("Esc", "clear the filter, then quit"),
+        (
+            "^C ^C",
+            "quit (twice quickly; the first ^C clears the filter; ^D ^D too)",
+        ),
     ];
     let area = centered(f.area(), 74, rows.len() as u16 + 4);
     f.render_widget(Clear, area);

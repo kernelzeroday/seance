@@ -6,6 +6,7 @@ mod config;
 mod folders;
 mod launch;
 mod model;
+mod select;
 mod sources;
 mod syslog;
 mod text;
@@ -54,6 +55,9 @@ struct Cli {
     /// Open straight into the new-session menu
     #[arg(short, long)]
     new: bool,
+    /// Leave the mouse to the terminal (no clicks, wheel or drag-to-copy)
+    #[arg(long)]
+    no_mouse: bool,
     /// Print the chosen command as `cd DIR && CMD` instead of running it
     #[arg(short, long, global = true)]
     print: bool,
@@ -175,7 +179,9 @@ fn real_main() -> Result<()> {
     match cli.cmd {
         None => {
             let agent = cli.agent.as_deref().map(parse_agent).transpose()?;
+            let mouse = !cli.no_mouse && cfg.mouse.unwrap_or(true);
             let plan = tui::run(tui::Start {
+                mouse,
                 cfg,
                 agent,
                 filter: cli.filter.join(" "),
