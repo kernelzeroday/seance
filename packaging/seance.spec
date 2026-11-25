@@ -38,6 +38,9 @@ install -Dpm 0755 target/rpm/release/seance %{buildroot}%{_bindir}/seance
 %{_bindir}/seance
 
 %changelog
+* Wed Nov 25 2026 kernelzeroday - 0.2.1-1
+- Click the resume line above the preview to copy the session's resume command.
+
 * Wed Nov 25 2026 kernelzeroday - 0.2.0-1
 - Full-text search of what was said in every session, in the picker (snippets, highlights,
   jump to match) and as `seance search`; `show --json --last N`; JSON results carry the

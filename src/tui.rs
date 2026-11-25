@@ -123,6 +123,8 @@ struct Hits {
     /// An open menu's frame, its rows, and the index of the first row shown.
     overlay: Option<Rect>,
     rows: Option<(Rect, usize)>,
+    /// The preview's "↵ resume command" line: a click copies the command.
+    resume: Rect,
 }
 
 /// A drag selection in the preview, tied to the session it was made in.
@@ -770,6 +772,9 @@ impl App {
                 self.last_click = Some((Instant::now(), x, y));
                 if self.overlay.is_some() {
                     return self.click_overlay(at, double, &hits);
+                }
+                if hits.resume.contains(at) {
+                    return self.copy_command();
                 }
                 if let Some((_, tab)) = hits.tabs.iter().find(|(r, _)| r.contains(at)) {
                     self.tab = *tab;
@@ -1577,12 +1582,20 @@ impl App {
         }
         head.push(Line::from(facts));
         let plan = launch::resume(&self.cfg, &s, &self.launch_dir);
+        // Clickable: copies the full command (folder and whole id), even when this is cut short.
+        let cmd = fit(&plan.display(), w.saturating_sub(4));
+        let pad = w.saturating_sub(2 + cmd.width() + 1);
+        self.hits.borrow_mut().resume = Rect {
+            x: inner.x,
+            y: inner.y + head.len() as u16,
+            width: inner.width,
+            height: 1,
+        };
         head.push(Line::from(vec![
             Span::styled("↵ ", Style::default().fg(ACCENT)),
-            Span::styled(
-                fit(&plan.display(), w.saturating_sub(2)),
-                Style::default().fg(FAINT),
-            ),
+            Span::styled(cmd, Style::default().fg(DIM)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled("⧉", Style::default().fg(ACCENT)),
         ]));
         head.push(Line::from(Span::styled(
             "─".repeat(w),
@@ -2237,7 +2250,10 @@ fn draw_help(f: &mut Frame) {
             "select preview text and copy it (double-click: a message)",
         ),
         ("^Y", "copy the conversation (wl-copy, xclip/xsel, OSC 52)"),
-        ("^E", "copy the resume command"),
+        (
+            "^E",
+            "copy the resume command (or click the ↵ line above the preview)",
+        ),
         ("^R", "rescan"),
         ("^U", "clear the filter"),
         ("Esc", "clear the filter, then quit"),

@@ -78,7 +78,7 @@ prompts, the assistant's prose and the tool calls it can read from them.
 | PgUp PgDn, Shift+↑↓ | scroll the preview                                        |
 | ^V             | show or hide the preview                                       |
 | ^Y             | copy the conversation to the clipboard (`wl-copy` on Wayland, `xclip`/`xsel` on X11, else OSC 52) |
-| ^E             | copy the resume command                                        |
+| ^E             | copy the resume command (or click the `↵ …` line above the preview) |
 | ^R             | rescan                                                         |
 | Esc            | clear the filter, then quit                                    |
 | ^C ^C, ^D ^D   | quit (press twice quickly; the first ^C also clears the filter) |
