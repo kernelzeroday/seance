@@ -1,0 +1,366 @@
+//! Readers for each agent's session store. Every reader is read-only: seance never writes to
+//! another program's files or databases.
+//!
+//! File-per-session stores (claude, codex, pi, omp, sd, fx) are parsed in parallel and the
+//! results cached by path, size and modification time, so a rescan only reads what changed.
+
+mod agy;
+mod claude;
+mod codex;
+mod fx;
+mod goose;
+mod hermes;
+mod opencode;
+mod pilike;
+mod sd;
+mod sparkle;
+
+use std::{
+    collections::HashMap,
+    fs,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::UNIX_EPOCH,
+};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::model::{Agent, Role, Session, Turn};
+
+/// The most turns a preview holds, newest kept.
+pub const MAX_TURNS: usize = 400;
+/// The longest a single turn's text gets in a preview.
+pub const MAX_TURN_CHARS: usize = 6000;
+
+pub fn home() -> PathBuf {
+    crate::text::home().unwrap_or_else(|| "/".into())
+}
+
+/// Sessions of one agent, newest first is not required (the caller sorts).
+pub fn scan(agent: Agent, cache: &FileCache) -> Result<Vec<Session>> {
+    match agent {
+        Agent::Claude => claude::scan(cache),
+        Agent::Codex => codex::scan(cache),
+        Agent::Agy => agy::scan(),
+        Agent::Omp => pilike::scan(Agent::Omp, cache),
+        Agent::Pi => pilike::scan(Agent::Pi, cache),
+        Agent::Hermes => hermes::scan(),
+        Agent::Fx => fx::scan(),
+        Agent::Goose => goose::scan(),
+        Agent::Opencode => opencode::scan(),
+        Agent::Sparkle => sparkle::scan(),
+        Agent::Sd => sd::scan(cache),
+    }
+}
+
+/// The conversation of `s`, oldest turn first, trimmed to [`MAX_TURNS`].
+pub fn transcript(s: &Session) -> Result<Vec<Turn>> {
+    let mut turns = match s.agent {
+        Agent::Claude => claude::transcript(s),
+        Agent::Codex => codex::transcript(s),
+        Agent::Agy => agy::transcript(s),
+        Agent::Omp | Agent::Pi => pilike::transcript(s),
+        Agent::Hermes => hermes::transcript(s),
+        Agent::Fx => fx::transcript(s),
+        Agent::Goose => goose::transcript(s),
+        Agent::Opencode => opencode::transcript(s),
+        Agent::Sparkle => sparkle::transcript(s),
+        Agent::Sd => sd::transcript(s),
+    }?;
+    turns.retain(|t| !t.text.trim().is_empty());
+    // Agents often split one reply into several events; show it as one turn.
+    let mut merged: Vec<Turn> = Vec::with_capacity(turns.len());
+    for t in turns {
+        match merged.last_mut() {
+            Some(prev) if prev.role == t.role && matches!(t.role, Role::Assistant | Role::Tool) => {
+                prev.text
+                    .push_str(if t.role == Role::Tool { "\n" } else { "\n\n" });
+                prev.text.push_str(t.text.trim());
+            }
+            _ => merged.push(Turn {
+                role: t.role,
+                text: t.text.trim().to_string(),
+            }),
+        }
+    }
+    let mut turns = merged;
+    for t in &mut turns {
+        if t.text.chars().count() > MAX_TURN_CHARS {
+            t.text = crate::text::clip(&t.text, MAX_TURN_CHARS);
+        }
+    }
+    if turns.len() > MAX_TURNS {
+        turns.drain(..turns.len() - MAX_TURNS);
+    }
+    Ok(turns)
+}
+
+// ---------------------------------------------------------------------------------------------
+// File cache
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Entry {
+    mtime: i128,
+    size: u64,
+    session: Option<Session>,
+}
+
+/// Parsed sessions keyed by file path, valid while the file's size and mtime match.
+#[derive(Default)]
+pub struct FileCache {
+    old: HashMap<PathBuf, Entry>,
+    new: Mutex<HashMap<PathBuf, Entry>>,
+}
+
+const CACHE_VERSION: u32 = 2;
+
+#[derive(Serialize, Deserialize)]
+struct CacheFile {
+    version: u32,
+    entries: HashMap<PathBuf, Entry>,
+}
+
+impl FileCache {
+    pub fn path() -> Option<PathBuf> {
+        directories::BaseDirs::new().map(|d| d.cache_dir().join("seance").join("index.json"))
+    }
+
+    pub fn load() -> FileCache {
+        let old = Self::path()
+            .and_then(|p| fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<CacheFile>(&b).ok())
+            .filter(|c| c.version == CACHE_VERSION)
+            .map(|c| c.entries)
+            .unwrap_or_default();
+        FileCache {
+            old,
+            new: Mutex::default(),
+        }
+    }
+
+    /// Writes the entries used by this scan (stale paths fall away).
+    pub fn save(&self) {
+        let Some(path) = Self::path() else { return };
+        let entries = self.new.lock().map(|m| m.clone()).unwrap_or_default();
+        let file = CacheFile {
+            version: CACHE_VERSION,
+            entries,
+        };
+        if let Some(dir) = path.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(bytes) = serde_json::to_vec(&file)
+            && fs::write(&tmp, bytes).is_ok()
+        {
+            let _ = fs::rename(&tmp, &path);
+        }
+    }
+
+    /// The session parsed from `path`, from the cache when the file is unchanged.
+    fn get(&self, path: &Path, parse: impl Fn(&Path) -> Option<Session>) -> Option<Session> {
+        let meta = fs::metadata(path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i128)
+            .unwrap_or(0);
+        let size = meta.len();
+        let entry = match self.old.get(path) {
+            Some(e) if e.mtime == mtime && e.size == size => e.clone(),
+            _ => Entry {
+                mtime,
+                size,
+                session: parse(path),
+            },
+        };
+        let session = entry.session.clone();
+        if let Ok(mut m) = self.new.lock() {
+            m.insert(path.to_path_buf(), entry);
+        }
+        session
+    }
+
+    /// Parses every file in parallel through the cache.
+    pub fn parse_all(
+        &self,
+        files: Vec<PathBuf>,
+        parse: impl Fn(&Path) -> Option<Session> + Sync,
+    ) -> Vec<Session> {
+        let next = AtomicUsize::new(0);
+        let out = Mutex::new(Vec::with_capacity(files.len()));
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(files.len().max(1));
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(f) = files.get(i) else { break };
+                        if let Some(s) = self.get(f, &parse)
+                            && let Ok(mut o) = out.lock()
+                        {
+                            o.push(s);
+                        }
+                    }
+                });
+            }
+        });
+        out.into_inner().unwrap_or_default()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Helpers shared by the readers
+
+pub fn mtime_secs(path: &Path) -> i64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Files under `dir` (recursively, to `depth` levels) whose name ends with `suffix`.
+pub fn files_with(dir: &Path, suffix: &str, depth: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    fn walk(dir: &Path, suffix: &str, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if depth > 0 {
+                    walk(&p, suffix, depth - 1, out);
+                }
+            } else if p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(suffix))
+            {
+                out.push(p);
+            }
+        }
+    }
+    walk(dir, suffix, depth, &mut out);
+    out
+}
+
+/// Calls `f` for each JSON line of a file, skipping lines that don't parse. `f` returns false
+/// to stop early.
+pub fn each_json_line(path: &Path, mut f: impl FnMut(&str, Value) -> bool) -> Result<()> {
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let l = line.trim_end();
+        if l.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(l)
+            && !f(l, v)
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Text from a message `content` that is a string or an array of `{type, text}` parts.
+pub fn content_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                Value::String(s) => Some(s.as_str()),
+                _ => {
+                    let ty = p.get("type").and_then(Value::as_str).unwrap_or("text");
+                    if matches!(ty, "text" | "input_text" | "output_text") {
+                        p.get("text").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// A compact one-line description of a tool call: `name  arg-ish summary`.
+pub fn tool_line(name: &str, input: Option<&Value>) -> String {
+    let arg = input.and_then(|i| {
+        let i = match i {
+            // Some agents store arguments as a JSON string.
+            Value::String(s) => {
+                serde_json::from_str::<Value>(s).unwrap_or(Value::String(s.clone()))
+            }
+            other => other.clone(),
+        };
+        for k in [
+            "command",
+            "cmd",
+            "file_path",
+            "path",
+            "pattern",
+            "query",
+            "url",
+            "description",
+            "prompt",
+        ] {
+            if let Some(v) = i.get(k) {
+                let s = match v {
+                    Value::String(s) => s.clone(),
+                    Value::Array(a) => a
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    _ => continue,
+                };
+                return Some(s);
+            }
+        }
+        match i {
+            Value::String(s) => Some(s),
+            _ => None,
+        }
+    });
+    match arg {
+        Some(a) => format!("{name}  {}", crate::text::one_line(&a, 160)),
+        None => name.to_string(),
+    }
+}
+
+/// Opens an SQLite database read-only, without creating anything.
+pub fn open_db(path: &Path) -> Result<rusqlite::Connection> {
+    use rusqlite::OpenFlags;
+    let c = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open {}", path.display()))?;
+    c.busy_timeout(std::time::Duration::from_millis(500))?;
+    Ok(c)
+}
+
+/// Turns a stored title or prompt into a list title.
+pub fn titleize(s: &str) -> String {
+    crate::text::one_line(&crate::text::strip_tags(s), 200)
+}
