@@ -4,6 +4,7 @@
 //! hide = ["sd"]                 # agents left out of the list and the new-session menu
 //! preview = true                # show the preview pane on start
 //! mouse = true                  # clicks, wheel and drag-to-copy (false: terminal selection)
+//! return = true                 # back to seance when the agent exits (false: like --once)
 //!
 //! [agents.claude]
 //! command = "claude"            # program to run (a name on PATH or a full path)
@@ -16,13 +17,17 @@ use serde::Deserialize;
 
 use crate::model::Agent;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub hide: Vec<String>,
     pub preview: Option<bool>,
     /// Capture the mouse (default true); false leaves selection to the terminal.
     pub mouse: Option<bool>,
+    /// Come back to seance when the agent exits (default true); false hands the terminal
+    /// over for good, as `--once` does.
+    #[serde(rename = "return")]
+    pub return_to_seance: Option<bool>,
     pub agents: HashMap<String, AgentConfig>,
 }
 

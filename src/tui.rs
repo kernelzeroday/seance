@@ -69,6 +69,8 @@ pub struct Start {
     pub launch_dir: PathBuf,
     /// Capture the mouse (clicks, wheel, drag-to-copy in the preview).
     pub mouse: bool,
+    /// A message for the footer on open (how the last agent exited).
+    pub notice: Option<(String, bool)>,
 }
 
 enum Overlay {
@@ -233,6 +235,9 @@ pub fn run(start: Start) -> Result<Option<Plan>> {
         quit_armed: None,
     };
     app.rescan();
+    if let Some((msg, bad)) = start.notice {
+        app.notice(msg, if bad { Tone::Bad } else { Tone::Info });
+    }
     if start.new {
         app.open_new(start.agent);
     }
@@ -1806,12 +1811,16 @@ fn init_terminal(mouse: bool) -> Result<Term> {
         execute,
         terminal::{EnterAlternateScreen, enable_raw_mode},
     };
-    // Put the terminal back if anything panics while it is in raw mode.
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        hook(info);
-    }));
+    // Put the terminal back if anything panics while it is in raw mode. Installed once:
+    // seance opens the terminal again each time it comes back from an agent.
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            hook(info);
+        }));
+    });
     enable_raw_mode()?;
     execute!(
         std::io::stderr(),

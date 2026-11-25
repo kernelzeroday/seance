@@ -92,7 +92,7 @@ as `~/src/x` then Enter jumps there.
 ## Command line
 
 ```
-seance [FILTER…]          open the picker (-a AGENT one tab, -H only this folder, -n new-session menu, --no-mouse)
+seance [FILTER…]          open the picker (-a AGENT one tab, -H only this folder, -n new-session menu, --no-mouse, --once)
 seance list [-a AGENT] [-H] [-n N] [--json]
 seance show ID [--copy]   print a session's conversation, or copy it
 seance resume ID          resume by id (a unique prefix is enough)
@@ -107,7 +107,11 @@ this shell function resumes a session and leaves your shell in its folder:
 sea() { local c; c=$(seance --print "$@") && eval "$c"; }
 ```
 
-Without `--print`, seance replaces itself with the agent (`exec`) in the session's folder.
+Without `--print`, seance runs the agent in the session's folder and **comes back to the
+picker when it exits**, with the session you just used on top (a failed exit is shown in the
+footer). While the agent runs, Ctrl+C goes to the agent only; Ctrl+Z suspends both and your
+shell's `fg` resumes them. `--once` (or `return = false` in the config) hands the terminal
+over for good instead (`exec`).
 
 ## Config
 
@@ -117,6 +121,7 @@ Without `--print`, seance replaces itself with the agent (`exec`) in the session
 hide = ["sd"]                 # agents left out of the list and the new-session menu
 preview = true                # show the preview pane on start
 mouse = true                  # clicks, wheel and drag-to-copy; false leaves the mouse to the terminal
+return = true                 # back to seance when the agent exits; false hands over for good (--once)
 
 [agents.claude]
 command = "claude"            # program to run

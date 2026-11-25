@@ -83,6 +83,42 @@ impl Plan {
         format!("{}  in {}", cmd.join(" "), tilde(&self.cwd))
     }
 
+    /// Runs the agent in the foreground and waits for it to exit, so seance can come back.
+    ///
+    /// While it runs, seance ignores SIGINT and SIGQUIT (Ctrl+C belongs to the agent, as
+    /// with a shell's `system()`); the child gets them back at their defaults. Ctrl+Z is
+    /// left alone: it stops seance and the agent together and the shell's `fg` resumes both.
+    pub fn run(&self) -> Result<std::process::ExitStatus> {
+        if which(&self.program).is_none() {
+            bail!("{} is not installed (not found on PATH)", self.program);
+        }
+        crate::syslog::info(&format!("run {}: {}", self.agent.key(), self.shell()));
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args)
+            .current_dir(&self.cwd)
+            .env("PWD", &self.cwd);
+        // SAFETY: only async-signal-safe calls (signal(2)) between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let (old_int, old_quit) = unsafe {
+            (
+                libc::signal(libc::SIGINT, libc::SIG_IGN),
+                libc::signal(libc::SIGQUIT, libc::SIG_IGN),
+            )
+        };
+        let status = cmd.spawn().and_then(|mut child| child.wait());
+        unsafe {
+            libc::signal(libc::SIGINT, old_int);
+            libc::signal(libc::SIGQUIT, old_quit);
+        }
+        status.map_err(|e| anyhow::anyhow!("could not run {}: {e}", self.program))
+    }
+
     /// Replaces this process with the agent. Only returns on failure.
     pub fn exec(&self) -> Result<()> {
         if which(&self.program).is_none() {

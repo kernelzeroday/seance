@@ -59,6 +59,9 @@ struct Cli {
     /// Leave the mouse to the terminal (no clicks, wheel or drag-to-copy)
     #[arg(long)]
     no_mouse: bool,
+    /// Hand the terminal to the agent for good instead of coming back when it exits
+    #[arg(long)]
+    once: bool,
     /// Print the chosen command as `cd DIR && CMD` instead of running it
     #[arg(short, long, global = true)]
     print: bool,
@@ -155,6 +158,18 @@ fn find<'a>(all: &'a [Session], id: &str) -> Result<&'a Session> {
     }
 }
 
+/// The footer message for an agent that exited: (text, is it a failure).
+fn exit_notice(agent: &str, st: std::process::ExitStatus) -> (String, bool) {
+    use std::os::unix::process::ExitStatusExt;
+    match (st.code(), st.signal()) {
+        // Ctrl+C is how many agents are closed; that is not a failure.
+        (Some(0 | 130), _) | (None, Some(libc::SIGINT)) => (format!("back from {agent}"), false),
+        (Some(code), _) => (format!("{agent} exited with code {code}"), true),
+        (None, Some(sig)) => (format!("{agent} was killed by signal {sig}"), true),
+        (None, None) => (format!("{agent} exited"), true),
+    }
+}
+
 fn run_plan(plan: Plan, print: bool) -> Result<()> {
     if print {
         println!("{}", plan.shell());
@@ -181,20 +196,35 @@ fn real_main() -> Result<()> {
         None => {
             let agent = cli.agent.as_deref().map(parse_agent).transpose()?;
             let mouse = !cli.no_mouse && cfg.mouse.unwrap_or(true);
-            let plan = tui::run(tui::Start {
-                mouse,
-                cfg,
-                agent,
-                filter: cli.filter.join(" "),
-                here_only: cli.here,
-                new: cli.new,
-                launch_dir: here,
-            })?;
-            match plan {
-                Some(p) => run_plan(p, cli.print),
-                // Nothing chosen: a failing status keeps `eval "$(seance --print)"` a no-op.
-                None if cli.print => std::process::exit(1),
-                None => Ok(()),
+            let comeback = !cli.once && !cli.print && cfg.return_to_seance.unwrap_or(true);
+            let (mut filter, mut new, mut notice) = (cli.filter.join(" "), cli.new, None);
+            loop {
+                let plan = tui::run(tui::Start {
+                    mouse,
+                    cfg: cfg.clone(),
+                    agent,
+                    filter: std::mem::take(&mut filter),
+                    here_only: cli.here,
+                    new: std::mem::take(&mut new),
+                    launch_dir: here.clone(),
+                    notice: notice.take(),
+                })?;
+                let Some(p) = plan else {
+                    // Nothing chosen: a failing status keeps `eval "$(seance --print)"` a no-op.
+                    if cli.print {
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                };
+                if !comeback {
+                    return run_plan(p, cli.print);
+                }
+                // Run the agent, then come back to the picker with how it went.
+                eprintln!("\x1b[38;2;255;160;200m↪\x1b[0m {}", p.display());
+                notice = Some(match p.run() {
+                    Ok(st) => exit_notice(p.agent.key(), st),
+                    Err(e) => (format!("{e:#}"), true),
+                });
             }
         }
         Some(Cmd::List {
