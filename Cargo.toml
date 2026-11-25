@@ -1,6 +1,6 @@
 [package]
 name = "seance"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "One picker for every coding agent's sessions: browse, preview, resume, or start new"
 license = "Apache-2.0"

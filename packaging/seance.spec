@@ -13,6 +13,7 @@ URL:            https://github.com/kernelzeroday/seance
 BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  gcc
+Recommends:     wl-clipboard
 
 %description
 seance lists the sessions that coding agents leave behind (Claude Code, Codex,
@@ -37,6 +38,10 @@ install -Dpm 0755 target/rpm/release/seance %{buildroot}%{_bindir}/seance
 %{_bindir}/seance
 
 %changelog
+* Tue Nov 24 2026 kernelzeroday - 0.1.1-1
+- ^Y copies the previewed conversation with wl-copy (xclip/xsel, OSC 52 fallback);
+  ^E copies the resume command; seance show --copy.
+
 * Tue Nov 24 2026 kernelzeroday - 0.1.0-1
 - First release: sessions of claude, codex, agy, omp, pi, hermes, fx, goose, opencode,
   sparkle and sd; preview, resume, new session with folder browser.

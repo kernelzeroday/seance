@@ -210,3 +210,26 @@ impl Turn {
         }
     }
 }
+
+/// A session's conversation as plain text: a header line, then `[who]` blocks.
+pub fn plain(s: &Session, turns: &[Turn]) -> String {
+    let mut out = format!(
+        "{} · {} · {}\n",
+        s.agent.key(),
+        s.title,
+        s.cwd
+            .as_ref()
+            .map(|c| crate::text::tilde(c))
+            .unwrap_or_default()
+    );
+    for t in turns {
+        let who = match t.role {
+            Role::User => "you",
+            Role::Assistant => s.agent.key(),
+            Role::Tool => "tool",
+            Role::Info => "·",
+        };
+        out.push_str(&format!("\n[{who}]\n{}\n", t.text));
+    }
+    out
+}

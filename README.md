@@ -55,7 +55,8 @@ prompts, the assistant's prose and the tool calls it can read from them.
 | ^O             | only sessions under the current folder                         |
 | PgUp PgDn, Shift+↑↓ | scroll the preview                                        |
 | ^V             | show or hide the preview                                       |
-| ^Y             | copy the resume command to the clipboard (OSC 52)             |
+| ^Y             | copy the conversation to the clipboard (`wl-copy` on Wayland, `xclip`/`xsel` on X11, else OSC 52) |
+| ^E             | copy the resume command                                        |
 | ^R             | rescan                                                         |
 | Esc            | clear the filter, then quit                                    |
 
@@ -69,7 +70,7 @@ as `~/src/x` then Enter jumps there.
 ```
 seance [FILTER…]          open the picker (-a AGENT opens one tab, -H only this folder, -n new-session menu)
 seance list [-a AGENT] [-H] [-n N] [--json]
-seance show ID            print a session's conversation
+seance show ID [--copy]   print a session's conversation, or copy it
 seance resume ID          resume by id (a unique prefix is enough)
 seance new AGENT [DIR]    start a new session
 seance agents             which agents are installed, with session counts

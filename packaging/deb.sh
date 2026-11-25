@@ -55,6 +55,7 @@ Maintainer: seance contributors <noreply@github.com>
 Homepage: https://github.com/kernelzeroday/seance
 Installed-Size: $size
 Depends: $depends
+Recommends: wl-clipboard | xclip | xsel
 Section: utils
 Priority: optional
 Description: one picker for every coding agent's sessions

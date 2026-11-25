@@ -3,7 +3,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -459,16 +458,38 @@ impl App {
     }
 
     fn copy_command(&mut self) {
-        let plan = match self.selected() {
-            Some(s) => launch::resume(&self.cfg, s, &self.launch_dir),
-            None => return,
+        let Some(s) = self.selected() else { return };
+        let cmd = launch::resume(&self.cfg, s, &self.launch_dir).shell();
+        match crate::clipboard::copy(&cmd) {
+            Ok(via) => self.notice(format!("copied via {via}: {cmd}"), Tone::Info),
+            Err(e) => self.notice(format!("copy failed: {e:#}"), Tone::Bad),
+        }
+    }
+
+    /// Copies the highlighted session's conversation, as the preview shows it.
+    fn copy_preview(&mut self) {
+        let Some(s) = self.selected().cloned() else {
+            return;
         };
-        let cmd = plan.shell();
-        // OSC 52: the terminal puts it on the clipboard (works over ssh too).
-        let mut out = std::io::stderr();
-        let _ = write!(out, "\x1b]52;c;{}\x07", base64(cmd.as_bytes()));
-        let _ = out.flush();
-        self.notice(format!("copied: {cmd}"), Tone::Info);
+        let turns = match self.previews.get(&key(&s)) {
+            Some(Preview::Ready(t)) => t.clone(),
+            // Not loaded yet (or the preview is hidden): read it now.
+            _ => match sources::transcript(&s) {
+                Ok(t) => Arc::new(t),
+                Err(e) => return self.notice(format!("can't read this session: {e:#}"), Tone::Bad),
+            },
+        };
+        let text = crate::model::plain(&s, &turns);
+        match crate::clipboard::copy(&text) {
+            Ok(via) => self.notice(
+                format!(
+                    "copied the conversation ({} lines) via {via}",
+                    text.lines().count()
+                ),
+                Tone::Info,
+            ),
+            Err(e) => self.notice(format!("copy failed: {e:#}"), Tone::Bad),
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -631,7 +652,8 @@ impl App {
                 self.previews.clear();
                 self.rescan();
             }
-            KeyCode::Char('y') if ctrl => self.copy_command(),
+            KeyCode::Char('y') if ctrl => self.copy_preview(),
+            KeyCode::Char('e') if ctrl => self.copy_command(),
             KeyCode::Char('f') if ctrl => {
                 // New session with the highlighted agent, choosing a folder.
                 let agent = self
@@ -1085,6 +1107,7 @@ impl App {
                 ("⇥", "agent"),
                 ("^O", "here only"),
                 ("PgUp/Dn", "scroll"),
+                ("^Y", "copy"),
                 ("^V", "preview"),
                 ("?", "help"),
             ],
@@ -1427,7 +1450,8 @@ fn draw_help(f: &mut Frame) {
         ("^O", "only sessions under the current folder"),
         ("PgUp PgDn", "scroll the preview (Shift+↑↓ by line)"),
         ("^V", "show or hide the preview"),
-        ("^Y", "copy the resume command (OSC 52)"),
+        ("^Y", "copy the conversation (wl-copy, xclip/xsel, OSC 52)"),
+        ("^E", "copy the resume command"),
         ("^R", "rescan"),
         ("^U", "clear the filter"),
         ("Esc", "clear the filter, then quit"),
@@ -1448,36 +1472,4 @@ fn draw_help(f: &mut Frame) {
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
-}
-
-fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(T[(n >> (18 - 6 * i)) as usize & 63] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn base64_matches_rfc4648() {
-        assert_eq!(super::base64(b""), "");
-        assert_eq!(super::base64(b"f"), "Zg==");
-        assert_eq!(super::base64(b"fo"), "Zm8=");
-        assert_eq!(super::base64(b"foobar"), "Zm9vYmFy");
-    }
 }

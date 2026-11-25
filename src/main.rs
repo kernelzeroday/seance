@@ -1,6 +1,7 @@
 //! seance: one picker for the sessions every coding agent leaves behind. Browse them, preview
 //! them, resume one, or start a new session with any agent in any folder.
 
+mod clipboard;
 mod config;
 mod folders;
 mod launch;
@@ -84,7 +85,12 @@ enum Cmd {
     /// Resume a session by id (a unique prefix is enough)
     Resume { id: String },
     /// Print a session's conversation, as the preview shows it
-    Show { id: String },
+    Show {
+        id: String,
+        /// Copy it to the clipboard (wl-copy, xclip/xsel, or OSC 52) instead of printing
+        #[arg(short = 'y', long)]
+        copy: bool,
+    },
     /// Start a new session with AGENT in DIR (default: here)
     New { agent: String, dir: Option<PathBuf> },
     /// Show which agents are installed and how many sessions each has
@@ -221,23 +227,15 @@ fn real_main() -> Result<()> {
             let s = find(&all, &id)?;
             run_plan(launch::resume(&cfg, s, &here), cli.print)
         }
-        Some(Cmd::Show { id }) => {
+        Some(Cmd::Show { id, copy }) => {
             let all = scan_all(&cfg);
             let s = find(&all, &id)?;
-            out!(
-                "{} · {} · {}",
-                s.agent.key(),
-                s.title,
-                s.cwd.as_ref().map(|c| text::tilde(c)).unwrap_or_default()
-            );
-            for t in sources::transcript(s)? {
-                let who = match t.role {
-                    model::Role::User => "you",
-                    model::Role::Assistant => s.agent.key(),
-                    model::Role::Tool => "tool",
-                    model::Role::Info => "·",
-                };
-                out!("\n[{who}]\n{}", t.text);
+            let text = model::plain(s, &sources::transcript(s)?);
+            if copy {
+                let via = clipboard::copy(&text)?;
+                eprintln!("copied {} lines via {via}", text.lines().count());
+            } else {
+                out!("{}", text.trim_end());
             }
             Ok(())
         }
